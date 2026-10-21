@@ -10,7 +10,7 @@
 
 | 你的海豹在哪 | 用哪个 | 说明 |
 | --- | --- | --- |
-| **Windows 电脑上** | Windows 版 | [windows/README-WINDOWS.txt](windows/README-WINDOWS.txt) |
+| **Windows 电脑上** | Windows 版 | [windows/README-v3.0.txt](windows/README-v3.0.txt) |
 | **Linux 服务器上** | Linux 版 | [docker/README-DOCKER.txt](docker/README-DOCKER.txt) |
 
 两版功能一样，选一个就行。
@@ -184,7 +184,7 @@
 > 但如果两个 js 文件同时存在，海豹只会加载先读到的那个，可能导致
 > 「看起来升级了、实际还是旧代码」。所以务必删掉旧 js。
 
-详细步骤见 [windows/升级说明-v2到v3.txt](windows/升级说明-v2到v3.txt)。
+详细步骤见 [升级说明-v2到v3.txt](升级说明-v2到v3.txt)。
 
 ---
 
@@ -219,9 +219,9 @@ windows/                      Windows 版
   OpenQQ-QQ-Sync-v3.0.js
   bridge_port.txt
   email_config.example.json
-  README-WINDOWS.txt
   README-v3.0.txt
-  升级说明-v2到v3.txt
+
+升级说明-v2到v3.txt            从 v2.0 升级的步骤
 
 docker/                       Linux 版
   Dockerfile

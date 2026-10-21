@@ -24,3 +24,6 @@ docker/config/email_config.json
 .vscode/
 .idea/
 *.swp
+
+# 打包产物不入库
+*.zip
