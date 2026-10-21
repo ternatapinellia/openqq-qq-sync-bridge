@@ -411,7 +411,8 @@ try:
         "", "", "", cur, "coc7", 1, 1, 2000))
     con.commit(); con.close()
     r = b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": cur, "group": DST_G})
-    check(r.get("pc", {}).get("action") == "updated", "OpenQQ 侧更新 -> 写回旧QQ", str(r.get("pc")))
+    _act = r.get("pc", {}).get("action")
+    check(_act in ("updated", "merged_to_old", "merged"), "OpenQQ 侧更新 -> 写回旧QQ", str(r.get("pc")))
     con = sqlite3.connect(os.path.join(w, "data.db")); con.row_factory = sqlite3.Row
     row = con.execute("SELECT data FROM attrs WHERE id=?", (old_id,)).fetchone()
     check(isinstance(row["data"], (bytes, bytearray)), "回写后的 data 是 blob", type(row["data"]).__name__)
@@ -426,11 +427,99 @@ try:
                 (json.dumps({"t":7,"v":{"dict":{"理智":{"t":0,"v":99}}}}).encode(), 9999, old_id))
     con.commit(); con.close()
     r = b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": cur, "group": DST_G})
-    check(r.get("pc", {}).get("action") == "skipped_older", "旧QQ 侧更新时不覆盖", str(r.get("pc")))
+    # 合并模式下，旧QQ 那份更新的值不会被覆盖；可能只是把缺失字段补过去
+    check(r.get("pc", {}).get("action") in ("skipped_older", "merged_to_new", "merged_to_old", "none"),
+          "旧QQ 侧更新时其值不被覆盖", str(r.get("pc")))
     con = sqlite3.connect(os.path.join(w, "data.db")); con.row_factory = sqlite3.Row
     d = json.loads(bytes(con.execute("SELECT data FROM attrs WHERE id=?", (old_id,)).fetchone()["data"]).decode())["v"]["dict"]
     con.close()
     check(d.get("理智", {}).get("v") == 99, "旧QQ 的 99 保住了", str(d.get("理智")))
+
+    # ---- 新增：PC 按字段合并 ----
+    section("5e. PC field merge")
+
+    def pc_ws(tag, old_fields, old_ms, new_fields, new_ms, old_exists=True, new_exists=True):
+        w = os.path.join(tmp, tag); shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
+        mod = load_bridge()
+        con = sqlite3.connect(os.path.join(w, "data.db"))
+        con.executescript(
+            "CREATE TABLE attrs(id text PRIMARY KEY,data blob,attrs_type text,binding_sheet_id text,"
+            "name text,owner_id text,sheet_type text,is_hidden numeric,created_at integer,updated_at integer);")
+        oid = OLD_GROUP + "-QQ:" + OLD_QQ
+        nid = DST_G + "-OpenQQ:INC"
+        if old_exists:
+            con.execute("INSERT INTO attrs VALUES(?,?,?,?,?,?,?,?,?,?)", (oid,
+                json.dumps({"t":7,"v":{"dict":old_fields}}).encode(), "", "", "", "", "coc7", 1, 1, old_ms))
+        if new_exists:
+            con.execute("INSERT INTO attrs VALUES(?,?,?,?,?,?,?,?,?,?)", (nid,
+                json.dumps({"t":7,"v":{"dict":new_fields}}).encode(), "", "", "", "OpenQQ:INC", "coc7", 1, 1, new_ms))
+        con.commit(); con.close()
+        con = sqlite3.connect(os.path.join(w, "data-logs.db"))
+        con.executescript(
+            "CREATE TABLE logs(id integer PRIMARY KEY AUTOINCREMENT,name text,group_id text,created_at integer,"
+            "updated_at integer,size integer,extra text,upload_url text,upload_time integer);"
+            "CREATE TABLE log_items(id integer PRIMARY KEY AUTOINCREMENT,log_id integer,group_id text,nickname text,"
+            "im_userid text,time integer,message text,is_dice numeric,command_id integer,command_info text,"
+            "raw_msg_id text,user_uniform_id text,removed integer,parent_id integer);")
+        con.commit(); con.close()
+        return w, mod, oid, nid
+
+    def read_pc(path, rid):
+        c = sqlite3.connect(path); c.row_factory = sqlite3.Row
+        row = c.execute("SELECT data FROM attrs WHERE id=?", (rid,)).fetchone()
+        c.close()
+        if not row: return None
+        return json.loads(bytes(row["data"]).decode())["v"]["dict"]
+
+    def fv(d, k):
+        e = (d or {}).get(k)
+        return e.get("v") if isinstance(e, dict) else None
+
+    # a) 两边各有独有字段 -> 互相补齐
+    w, mod, oid, nid = pc_ws("merge1", {"理智":{"t":0,"v":36}}, 1000, {"侦查":{"t":0,"v":80}}, 2000)
+    b = mod.Bridge(w)
+    b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G})
+    od = read_pc(os.path.join(w,"data.db"), oid)
+    nd = read_pc(os.path.join(w,"data.db"), nid)
+    check(fv(od,"理智") == 36 and fv(od,"侦查") == 80, "旧QQ 侧补齐了侦查", str(od))
+    check(fv(nd,"理智") == 36 and fv(nd,"侦查") == 80, "OpenQQ 侧补齐了理智", str(nd))
+
+    # b) 同名字段冲突，新的赢
+    w, mod, oid, nid = pc_ws("merge2", {"理智":{"t":0,"v":36}}, 1000, {"理智":{"t":0,"v":30}}, 2000)
+    b = mod.Bridge(w)
+    b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G})
+    od = read_pc(os.path.join(w,"data.db"), oid)
+    check(fv(od,"理智") == 30, "OpenQQ 更新时其值胜出", str(od))
+
+    # c) 旧QQ 更新时其值胜出，且写回 OpenQQ
+    w, mod, oid, nid = pc_ws("merge3", {"理智":{"t":0,"v":99}}, 5000, {"理智":{"t":0,"v":30}}, 2000)
+    b = mod.Bridge(w)
+    b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G})
+    od = read_pc(os.path.join(w,"data.db"), oid)
+    nd = read_pc(os.path.join(w,"data.db"), nid)
+    check(fv(od,"理智") == 99, "旧QQ 的 99 保住", str(od))
+    check(fv(nd,"理智") == 99, "OpenQQ 侧同步成 99", str(nd))
+
+    # d) 内容相同 -> 不写库
+    w, mod, oid, nid = pc_ws("merge4", {"理智":{"t":0,"v":36}}, 1000, {"理智":{"t":0,"v":36}}, 1000)
+    b = mod.Bridge(w)
+    r = b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G})
+    check(r.get("pc", {}).get("action") == "none", "内容相同不写库", str(r.get("pc")))
+
+    # e) 旧QQ 没有这行 -> 直接建
+    w, mod, oid, nid = pc_ws("merge5", {}, 0, {"理智":{"t":0,"v":30}}, 2000, old_exists=False)
+    b = mod.Bridge(w)
+    r = b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G})
+    od = read_pc(os.path.join(w,"data.db"), oid)
+    check(r.get("pc", {}).get("action") == "created_old", "旧QQ 侧新建 PC 行", str(r.get("pc")))
+    check(fv(od,"理智") == 30, "新建的内容正确", str(od))
+
+    # f) 旧QQ 某些字段有、OpenQQ 缺 -> 补到 OpenQQ
+    w, mod, oid, nid = pc_ws("merge6", {"理智":{"t":0,"v":36},"力量":{"t":0,"v":60}}, 3000, {"理智":{"t":0,"v":36}}, 1000)
+    b = mod.Bridge(w)
+    b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G})
+    nd = read_pc(os.path.join(w,"data.db"), nid)
+    check(fv(nd,"力量") == 60, "OpenQQ 侧补齐力量", str(nd))
 
     # 7) 同步关系登记 / 开关 / 删除（用独立 root，避免互相污染）
     w, mod = fresh_sync_ws("inc4", [])

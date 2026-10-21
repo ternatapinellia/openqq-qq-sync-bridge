@@ -834,7 +834,7 @@ class Bridge:
                 "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,"
                 "is_hidden,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (new_id, raw, a["attrs_type"], "", a["name"], current, a["sheet_type"],
-                 a["is_hidden"], a["created_at"], int(time.time() * 1000)),
+                 a["is_hidden"], a["created_at"], int(time.time())),
             )
             added += 1
         return added
@@ -863,57 +863,160 @@ class Bridge:
                 cands.append(r)
         if not cands:
             return None
-        return max(cands, key=lambda r: self._to_int(r["updated_at"], 0))
+        return max(cands, key=lambda r: self._norm_ts(r["updated_at"]))
 
-    def push_pc_to_old(self, con, old_owner, old_group_id, current):
-        """把 OpenQQ 侧的 PC 状态写回旧QQ。只在 OpenQQ 侧更新时覆盖，覆盖前备份。"""
-        res = {"action": "none", "old_len": None, "new_len": None}
-        src = self._find_openqq_state_for(con, old_owner, old_group_id)
-        if src is None:
-            return res
-        src_raw = bytes(src["data"] or b"")
-        if len(src_raw) <= 23:
-            return res  # 源是空的，不回写
+    @staticmethod
+    def _norm_ts(v):
+        """把时间戳归一化成秒。
+
+        海豹统一用秒，但历史版本的本工具曾误写过毫秒，
+        所以大于 1e11 的值按毫秒处理，避免新旧数据比较错乱。
+        """
+        n = Bridge._to_int(v, 0)
+        if n > 100000000000:      # > 1e11 视为毫秒
+            n = n // 1000
+        return n
+
+    @staticmethod
+    def _load_pc_dict(raw):
+        """把 attrs.data 解析成 {"字段": 值} 形态；失败返回 None。"""
         try:
-            src_doc = json.loads(src_raw.decode("utf-8"))
-            src_dict = src_doc["v"]["dict"]
+            doc = json.loads(bytes(raw or b"").decode("utf-8"))
+            d = doc["v"]["dict"]
+            return d if isinstance(d, dict) else None
         except Exception:
-            return res
-        # 旧QQ 侧目标行（就是旧QQ自己的键）
+            return None
+
+    @staticmethod
+    def _field_value(entry):
+        """取字段的原始值（海豹的格式是 {"t":0,"v":51}）。"""
+        if isinstance(entry, dict):
+            return entry.get("v")
+        return entry
+
+    @staticmethod
+    def _pc_equal(a, b):
+        """比较两个 PC 字典内容是否等价（不比字节，比字段值）。"""
+        if a == b:
+            return True
+        if not a and not b:
+            return True
+        if not a or not b:
+            return False
+        if set(a.keys()) != set(b.keys()):
+            return False
+        for k in a:
+            if Bridge._field_value(a[k]) != Bridge._field_value(b[k]):
+                return False
+        return True
+
+    @staticmethod
+    def _build_pc_data(fields):
+        raw = json.dumps({"t": 7, "v": {"dict": fields}},
+                         ensure_ascii=False, separators=(",", ":"))
+        return raw.encode("utf-8")
+
+    def merge_pc_fields(self, con, old_owner, old_group_id, current):
+        """按字段合并两边的 PC 数据，双向都补齐。
+
+        规则：
+          * 两边都有的字段 -> 取 updated_at 较新那一侧的整份字典里的值
+          * 只有一边有的字段 -> 直接补到另一边
+          * 单独某个字段没有自己的时间戳，所以以「这份 PC 行整体的 updated_at」
+            作为该行所有字段的时间依据（海豹就是这么存的）
+          * 合并后如果内容没变，不写库，也不会改动 updated_at
+        """
+        res = {"action": "none", "added_to_old": 0, "added_to_new": 0,
+               "old_len": None, "new_len": None, "old_ms": 0, "new_ms": 0}
+
+        src = self._find_openqq_state_for(con, old_owner, old_group_id)
+        src_id = str(src["id"]) if src is not None else None
+        src_dict = self._load_pc_dict(src["data"]) if src is not None else None
+        new_ms = self._norm_ts(src["updated_at"]) if src is not None else 0
+
+        tgt_id = old_group_id + "-" + old_owner
         tgt = con.execute(
-            "SELECT id,data,updated_at FROM attrs WHERE id=?", (old_group_id + "-" + old_owner,)
+            "SELECT id,data,attrs_type,updated_at FROM attrs WHERE id=?", (tgt_id,)
         ).fetchone()
-        tgt_raw = bytes(tgt["data"] or b"") if tgt else b""
-        res["old_len"] = len(tgt_raw)
-        res["new_len"] = len(src_raw)
+        tgt_dict = self._load_pc_dict(tgt["data"]) if tgt is not None else None
+        old_ms = self._norm_ts(tgt["updated_at"]) if tgt is not None else 0
+
         if tgt is not None:
-            # 旧QQ 侧的 PC 不一定带 updated_at 语义，只在「旧侧更新更早」时覆盖
-            old_ms = self._to_int(tgt["updated_at"], 0)
-            new_ms = self._to_int(src["updated_at"], 0)
-            if old_ms and new_ms and old_ms >= new_ms:
-                res["action"] = "skipped_older"
-                return res
-            merged = src_dict
-            # data 必须是 blob，海豹按 blob 读取
-            merged_raw = json.dumps({"t": 7, "v": {"dict": merged}},
-                                    ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            con.execute(
-                "UPDATE attrs SET data=?,attrs_type=?,binding_sheet_id=?,owner_id=?,sheet_type=?,"
-                "is_hidden=?,updated_at=? WHERE id=?",
-                (merged_raw, src["attrs_type"], "", old_owner, "", 1, new_ms, tgt["id"]),
-            )
-            res["action"] = "updated"
-        else:
-            merged_raw = json.dumps({"t": 7, "v": {"dict": src_dict}},
-                                    ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            con.execute(
-                "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,"
-                "is_hidden,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (old_group_id + "-" + old_owner, merged_raw,
-                 src["attrs_type"], "", "", old_owner, "", 1, int(time.time()), self._to_int(src["updated_at"], 0)),
-            )
-            res["action"] = "created"
+            res["old_len"] = len(bytes(tgt["data"] or b""))
+        if src is not None:
+            res["new_len"] = len(bytes(src["data"] or b""))
+        res["old_ms"] = old_ms
+        res["new_ms"] = new_ms
+
+        if not src_dict and not tgt_dict:
+            return res
+
+        # 哪边的数据「更新」就作为同名字段值的优先来源
+        newer_is_openqq = bool(new_ms > old_ms)
+        newer_is_old = bool(old_ms > new_ms)
+
+        # 计算旧QQ侧合并后的字典：
+        #   * 旧QQ没有的字段 -> 从 OpenQQ 补过来
+        #   * 同名字段 -> 谁更新用谁（旧QQ侧要跟随较新的值）
+        merged_old = dict(tgt_dict or {})
+        if src_dict:
+            for k, v in src_dict.items():
+                if k not in merged_old:
+                    merged_old[k] = v
+                    res["added_to_old"] += 1
+                elif newer_is_openqq:
+                    merged_old[k] = v
+
+        # 计算 OpenQQ 侧合并后的字典，规则对称
+        merged_new = dict(src_dict or {})
+        if tgt_dict:
+            for k, v in tgt_dict.items():
+                if k not in merged_new:
+                    merged_new[k] = v
+                    res["added_to_new"] += 1
+                elif newer_is_old:
+                    merged_new[k] = v
+
+        # 海豹的 updated_at 是【秒】，不要用毫秒，否则时间比较会完全错乱
+        now_sec = int(time.time())
+
+        # --- 写回旧QQ 侧 ---
+        if merged_old:
+            if tgt is None:
+                con.execute(
+                    "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,"
+                    "sheet_type,is_hidden,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (tgt_id, self._build_pc_data(merged_old),
+                     (src["attrs_type"] if src is not None else ""), "", "", old_owner, "", 1,
+                     int(time.time()), new_ms or now_sec),
+                )
+                res["action"] = "created_old"
+            else:
+                if not self._pc_equal(merged_old, tgt_dict):
+                    con.execute(
+                        "UPDATE attrs SET data=?, updated_at=? WHERE id=?",
+                        (self._build_pc_data(merged_old), max(old_ms, new_ms) or now_sec, tgt["id"]),
+                    )
+                    if res["action"] == "none":
+                        res["action"] = "merged_to_old"
+
+        # --- 补齐 OpenQQ 侧（如果那边缺字段） ---
+        if src is not None and merged_new:
+            if not self._pc_equal(merged_new, src_dict):
+                con.execute(
+                    "UPDATE attrs SET data=?, updated_at=? WHERE id=?",
+                    (self._build_pc_data(merged_new), max(old_ms, new_ms) or now_sec, src_id),
+                )
+                if res["action"] == "none":
+                    res["action"] = "merged_to_new"
+
+        if res["action"] == "none" and (res["added_to_old"] or res["added_to_new"]):
+            res["action"] = "merged"
         return res
+
+    # 兼容旧调用名（外部如果引用过）
+    def push_pc_to_old(self, con, old_owner, old_group_id, current):
+        return self.merge_pc_fields(con, old_owner, old_group_id, current)
 
     # ---------------------- 全量一次同步 ----------------------
 
@@ -946,7 +1049,7 @@ class Bridge:
             try:
                 con.execute("BEGIN IMMEDIATE")
                 out["cards_added"] = self.sync_cards_add_only(con, old_owner, current)
-                out["pc"] = self.push_pc_to_old(con, old_owner, old_group_id, current)
+                out["pc"] = self.merge_pc_fields(con, old_owner, old_group_id, current)
                 con.commit()
             except Exception:
                 try:
@@ -993,7 +1096,8 @@ class Bridge:
     def bind(self, old, current, target_group, old_group):
         old_owner = "QQ:" + old
         old_group_id = "QQ-Group:" + old_group
-        now = int(time.time() * 1000)
+        # 海豹的 created_at / updated_at 是【秒】，保持一致
+        now = int(time.time())
         backup_path = self.backup_db_before_bind()
         logs_backup_path = self.backup_logs_before_bind()
         con = None
