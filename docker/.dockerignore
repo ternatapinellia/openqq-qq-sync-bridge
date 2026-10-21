@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.orig
+.env
+config/bridge_bindings.json
+config/bridge_error.log
+config/email_config.json
+sealdice-data/

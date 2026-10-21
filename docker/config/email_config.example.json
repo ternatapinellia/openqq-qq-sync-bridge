@@ -1,0 +1,8 @@
+{
+  "sender_email": "",
+  "smtp_host": "smtp.qq.com",
+  "smtp_port": 465,
+  "smtp_user": "",
+  "smtp_password": "",
+  "smtp_ssl": true
+}

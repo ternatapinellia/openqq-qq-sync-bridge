@@ -1,0 +1,25 @@
+# 用法：
+#   1) 复制 env 文件：cp .env.example .env  然后填好令牌
+#   2) 改下面的 volumes，指向你海豹的 data/default 目录
+#   3) docker compose up -d --build
+services:
+  openqq-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: openqq-qq-sync-bridge:2.0
+    container_name: openqq-bridge
+    restart: unless-stopped
+    ports:
+      # 只映射到宿主机回环，避免把桥直接暴露到公网。
+      # 如果海豹跑在别的机器/容器里，改成 "38999:38999" 并务必设置令牌。
+      - "127.0.0.1:38999:38999"
+    environment:
+      OPENQQ_BRIDGE_PORT: "38999"
+      # 强烈建议设置：容器内监听 0.0.0.0，没有令牌等于对网络开放。
+      OPENQQ_BRIDGE_TOKEN: "${OPENQQ_BRIDGE_TOKEN:?请先在 .env 里设置 OPENQQ_BRIDGE_TOKEN}"
+    volumes:
+      # 海豹数据目录（必须可写：迁移前要在同目录写备份）
+      - "${SEALDICE_DATA_DIR:-./sealdice-data}:/data"
+      # 桥自身配置（bridge_port.txt / email_config.json / bridge_bindings.json / bridge_error.log）
+      - "./config:/config"

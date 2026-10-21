@@ -1,0 +1,26 @@
+# 运行时/构建产物，不入库
+__pycache__/
+*.py[cod]
+.build/
+dist/
+build/
+*.spec
+
+# 桥的运行期数据（每个使用者各自生成，不要提交）
+bridge_bindings.json
+bridge_error.log
+email_config.json
+*.before-sync-*.bak
+*.snapshot-first.bak
+
+# Docker 本地配置与真实数据
+docker/.env
+docker/sealdice-data/
+docker/config/bridge_bindings.json
+docker/config/bridge_error.log
+docker/config/email_config.json
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
