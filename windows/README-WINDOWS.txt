@@ -12,11 +12,11 @@
 
   放在哪里                        放什么
   ----------------------------------------------------------
-  海豹主程序目录                   OpenQQ-QQ-Sync-Bridge-v2.0.exe
-  （和 data/ 平行）                启动OpenQQ同步桥-v2.0.cmd
+  海豹主程序目录                   OpenQQ-QQ-Sync-Bridge-v3.0.exe
+  （和 data/ 平行）                启动OpenQQ同步桥-v3.0.cmd
                                   bridge_port.txt
 
-  海豹的 js 插件目录               OpenQQ-QQ-Sync-v2.0.js
+  海豹的 js 插件目录               OpenQQ-QQ-Sync-v3.0.js
 
   海豹插件的配置界面               邮箱、SMTP 授权码（见第三节）
 
@@ -29,8 +29,8 @@
   |  \- default/
   |     |- data.db          <- 海豹的数据库，同步桥会读它
   |     \- data-logs.db
-  |- OpenQQ-QQ-Sync-Bridge-v2.0.exe     <- 放这里
-  |- 启动OpenQQ同步桥-v2.0.cmd           <- 放这里
+  |- OpenQQ-QQ-Sync-Bridge-v3.0.exe     <- 放这里
+  |- 启动OpenQQ同步桥-v3.0.cmd           <- 放这里
   |- bridge_port.txt                    <- 放这里（内容默认 38999）
   \- ...
 
@@ -42,9 +42,9 @@
 二、启动同步桥
 --------------------------------------------------------------
 
-双击 启动OpenQQ同步桥-v2.0.cmd，会弹出一个黑色窗口，出现这些内容就是成功了：
+双击 启动OpenQQ同步桥-v3.0.cmd，会弹出一个黑色窗口，出现这些内容就是成功了：
 
-  OpenQQ QQ Sync Bridge v2.0
+  OpenQQ QQ Sync Bridge v3.0
   Listening: 127.0.0.1:38999
   Data dir: D:\Sealdice\data\default
   Config dir: D:\Sealdice
@@ -61,7 +61,7 @@
 三、在海豹里配置插件
 --------------------------------------------------------------
 
-加载 OpenQQ-QQ-Sync-v2.0.js 后，在插件配置界面填这几项：
+加载 OpenQQ-QQ-Sync-v3.0.js 后，在插件配置界面填这几项：
 
   发件邮箱      ： 你的 QQ 邮箱，如 123456@qq.com
   SMTP授权码    ： QQ 邮箱的 SMTP 授权码（不是 QQ 登录密码！见下面）
@@ -179,7 +179,7 @@ SMTP 授权码怎么拿：
 --------------------------------------------------------------
 
 双击 cmd，窗口一闪就没了
-  OpenQQ-QQ-Sync-Bridge-v2.0.exe 和 bridge_port.txt 是不是没和 cmd
+  OpenQQ-QQ-Sync-Bridge-v3.0.exe 和 bridge_port.txt 是不是没和 cmd
   放在一起？三个文件必须在同一个文件夹里。
 
 插件报“无法连接同步桥 38999”

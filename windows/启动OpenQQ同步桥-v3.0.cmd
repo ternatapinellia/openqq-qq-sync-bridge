@@ -14,8 +14,8 @@ set /a PORT_NUM=%PORT% >nul 2>&1
 if %PORT_NUM% LSS 1 set "PORT=38999"
 if %PORT_NUM% GTR 65535 set "PORT=38999"
 
-echo Starting OpenQQ QQ Sync Bridge v2.0 on port %PORT%...
-OpenQQ-QQ-Sync-Bridge-v2.0.exe --port %PORT%
+echo Starting OpenQQ QQ Sync Bridge v3.0 on port %PORT%...
+OpenQQ-QQ-Sync-Bridge-v3.0.exe --port %PORT%
 set "ERR=%errorlevel%"
 
 if "%ERR%"=="0" (

@@ -7,7 +7,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: openqq-qq-sync-bridge:2.0
+    image: openqq-qq-sync-bridge:3.0
     container_name: openqq-bridge
     restart: unless-stopped
     ports:

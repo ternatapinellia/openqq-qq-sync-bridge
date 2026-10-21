@@ -54,6 +54,7 @@ def section(title):
 OLD_GROUP = "QQ-Group:1081354778"
 TGT_GROUP = "OpenQQ-Group:4019039592-D3B44D0DFEC6A0EDF40AE7D10DA61273"
 OLD_QQ = "1721175359"
+OLD_GROUP_BARE = "1081354778"
 
 
 def build_workspace(tmp, tag, target_logs=None, with_cards=True):
@@ -203,6 +204,128 @@ try:
     r2 = b.migrate_logs(OLD_GROUP, TGT_GROUP)
     check(r1["log_count"] == 1 and r1["log_skipped"] == 0, "rename case: run1 copies", json.dumps(r1, ensure_ascii=False))
     check(r2["log_count"] == 0 and r2["log_skipped"] == 1, "rename case: run2 recognised the renamed copy", json.dumps(r2, ensure_ascii=False))
+
+    # -------------------------------------------------- 5b. 群属性必须安全
+    section("5b. group attribute safety")
+    from seadice_fixture import make_data_db, make_logs_db, CARD_BLOB
+
+    def mkcards(path, rows):
+        """rows: list of (id, name, owner, data_len, bind)"""
+        con = sqlite3.connect(path)
+        for cid, name, owner, dlen, bind in rows:
+            blob = b"x" * dlen
+            con.execute(
+                "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,is_hidden,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (cid, blob, "character", "", name, owner, "coc7", 0, 1, 1),
+            )
+        con.commit(); con.close()
+
+    def mk_group_attr(path, gid, owner, bind, dlen):
+        con = sqlite3.connect(path)
+        con.execute(
+            "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,is_hidden,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (gid, b"g" * dlen, "", bind, "", owner, "coc7", 1, 1, 1),
+        )
+        con.commit(); con.close()
+
+    # 场景：目标群已经有真实数据（>23 字节），迁移绝不能覆盖它
+    w = os.path.join(tmp, "grp"); shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
+    mod = load_bridge()
+    make_data_db(os.path.join(w, "data.db"), with_cards=False)
+    make_logs_db(os.path.join(w, "data-logs.db"), [])
+    p_old = "QQ:1721175359"
+    p_cur = "OpenQQ:4019039592-ABC"
+    tgt = TGT_GROUP + "-" + p_cur
+    mkcards(os.path.join(w, "data.db"), [("card-old-1", "旧卡", p_old, 600, "")])
+    # 目标群已存在的真实状态
+    mk_group_attr(os.path.join(w, "data.db"), tgt, p_cur, "own-card", 607)
+    mkcards(os.path.join(w, "data.db"), [("own-card", "自己的卡", p_cur, 600, "")])
+    # 旧群属性：绑定指向旧卡
+    mk_group_attr(os.path.join(w, "data.db"), OLD_GROUP + "-" + p_old, p_old, "card-old-1", 500)
+
+    b = mod.Bridge(w)
+    r = b.bind(OLD_QQ, p_cur, TGT_GROUP, OLD_GROUP_BARE)
+    con = sqlite3.connect(os.path.join(w, "data.db")); con.row_factory = sqlite3.Row
+    row = con.execute("SELECT data,binding_sheet_id FROM attrs WHERE id=?", (tgt,)).fetchone()
+    con.close()
+    check(len(bytes(row["data"])) == 607,
+          "existing group attribute data NOT overwritten", "len=%d" % len(bytes(row["data"])))
+    check(row["binding_sheet_id"] == "own-card",
+          "existing group attribute binding left as the user's own card", repr(row["binding_sheet_id"]))
+    check(r.get("group_attr_action") == "kept_existing",
+          "result reports the existing state was kept", str(r.get("group_attr_action")))
+
+    # 场景：目标群属性是空的（23 字节），应填入旧数据，但绑定必须改成新卡、不能指向旧 QQ 的卡
+    w = os.path.join(tmp, "grp2"); shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
+    mod = load_bridge()
+    make_data_db(os.path.join(w, "data.db"), with_cards=False)
+    make_logs_db(os.path.join(w, "data-logs.db"), [])
+    mkcards(os.path.join(w, "data.db"), [("card-old-1", "旧卡", p_old, 600, "")])
+    mk_group_attr(os.path.join(w, "data.db"), tgt, p_cur, "", 23)
+    mk_group_attr(os.path.join(w, "data.db"), OLD_GROUP + "-" + p_old, p_old, "card-old-1", 500)
+    b = mod.Bridge(w)
+    r = b.bind(OLD_QQ, p_cur, TGT_GROUP, OLD_GROUP_BARE)
+    con = sqlite3.connect(os.path.join(w, "data.db")); con.row_factory = sqlite3.Row
+    row = con.execute("SELECT data,binding_sheet_id FROM attrs WHERE id=?", (tgt,)).fetchone()
+    bound = row["binding_sheet_id"]
+    card = con.execute("SELECT owner_id,name FROM attrs WHERE id=?", (bound,)).fetchone() if bound else None
+    con.close()
+    check(len(bytes(row["data"])) == 500, "empty target state gets filled from source",
+          "len=%d" % len(bytes(row["data"])))
+    check(bound and bound != "card-old-1", "binding remapped to the NEW copy, not the source card", repr(bound))
+    check(card is not None and card["owner_id"] == p_cur,
+          "bound card belongs to the current user", str(dict(card) if card else None))
+
+    # 场景：旧群属性行已被别的用户占用 —— 不许拿来用
+    w = os.path.join(tmp, "grp3"); shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
+    mod = load_bridge()
+    make_data_db(os.path.join(w, "data.db"), with_cards=False)
+    make_logs_db(os.path.join(w, "data-logs.db"), [])
+    someone_else = "OpenQQ:4019039592-OTHER"
+    mkcards(os.path.join(w, "data.db"), [("foreign-card", "别人的卡", someone_else, 700, "")])
+    mk_group_attr(os.path.join(w, "data.db"), tgt, p_cur, "", 23)
+    # 源群属性属于旧QQ本人，但它绑定的卡是「别人名下」的（海豹允许同群共用）。
+    # 这种绑定必须原样保留，清空会让角色面板变空。
+    mk_group_attr(os.path.join(w, "data.db"), OLD_GROUP + "-" + p_old, p_old, "foreign-card", 500)
+    b = mod.Bridge(w)
+    r = b.bind(OLD_QQ, p_cur, TGT_GROUP, OLD_GROUP_BARE)
+    con = sqlite3.connect(os.path.join(w, "data.db")); con.row_factory = sqlite3.Row
+    row = con.execute("SELECT data,binding_sheet_id FROM attrs WHERE id=?", (tgt,)).fetchone()
+    con.close()
+    # 注意：海豹允许「群属性绑定他人的卡」并正常显示（同群共用车卡）。
+    # 因此这里必须【保留】原绑定，不能清空 —— 清空会让角色面板变成空的。
+    check(row["binding_sheet_id"] == "foreign-card",
+          "keeps a binding to another user's card (SeaDice shows it fine)",
+          repr(row["binding_sheet_id"]))
+
+    # ------------------------------------------- 5c. 绑定跟随复制（回归）
+    section("5c. binding follows the copied card")
+    w = os.path.join(tmp, "bindmap"); shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
+    mod = load_bridge()
+    make_data_db(os.path.join(w, "data.db"), with_cards=False)
+    make_logs_db(os.path.join(w, "data-logs.db"), [])
+    p_old = "QQ:1721175359"
+    p_cur = "OpenQQ:4019039592-XYZ"
+    tgt = TGT_GROUP + "-" + p_cur
+    # 旧QQ 自己的卡
+    mkcards(os.path.join(w, "data.db"), [("own-card-1", "我的卡", p_old, 600, "")])
+    # 旧群属性：绑定自己的卡，且有真实数据
+    mk_group_attr(os.path.join(w, "data.db"), OLD_GROUP + "-" + p_old, p_old, "own-card-1", 500)
+    b = mod.Bridge(w)
+    r = b.bind(OLD_QQ, p_cur, TGT_GROUP, OLD_GROUP_BARE)
+    con = sqlite3.connect(os.path.join(w, "data.db")); con.row_factory = sqlite3.Row
+    row = con.execute("SELECT data,binding_sheet_id FROM attrs WHERE id=?", (tgt,)).fetchone()
+    bound = (row["binding_sheet_id"] or "").strip()
+    card = con.execute("SELECT name,owner_id FROM attrs WHERE id=?", (bound,)).fetchone() if bound else None
+    con.close()
+    check(bound.startswith("own-card-1"), "binding points at the copied card", repr(bound))
+    check(bound != "own-card-1", "binding was remapped away from the source card", repr(bound))
+    check(card is not None and card["owner_id"] == p_cur, "remapped card belongs to current user",
+          str(dict(card) if card else None))
+    check(len(bytes(row["data"])) == 500, "group attribute data copied intact",
+          "len=%d" % len(bytes(row["data"])))
 
     # -------------------------------------------------- 6. parent_id 重映射
     section("6. parent_id remapping")

@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""OpenQQ QQ Sync Bridge v2.0 - multi SeaDice instance edition."""
+"""OpenQQ QQ Sync Bridge v3.0 - multi SeaDice instance edition."""
 import argparse, json, os, sqlite3, time, sys, secrets, smtplib, ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from email.message import EmailMessage
 
-VERSION = "2.0"
+VERSION = "3.0"
 DEFAULT_PORT = 38999
 PORT_FILE_NAME = "bridge_port.txt"
 
@@ -552,17 +552,41 @@ class Bridge:
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("BEGIN IMMEDIATE")
 
-            char_rows = con.execute(
+            # 同样用全表扫描：owner_id 上的索引可能损坏。
+            char_rows = []
+            for row in con.execute(
                 "SELECT id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,is_hidden,created_at,updated_at "
-                "FROM attrs WHERE owner_id=? ORDER BY updated_at DESC", (old_owner,)
-            ).fetchall()
+                "FROM attrs"
+            ).fetchall():
+                if str(row["owner_id"] or "") != old_owner:
+                    continue
+                char_rows.append(row)
+            char_rows.sort(key=lambda r: int(r["updated_at"] or 0), reverse=True)
 
             exact_id = old_group_id + "-" + old_owner
-            attr_rows = con.execute(
+            # 只认属于旧 QQ 本人的群属性行（owner_id 是旧 QQ，或为空未被占用）。
+            # 只按 id 匹配不安全：同一条 id 可能已被别的 OpenQQ 用户接管，
+            # 那样会把别人的角色卡绑定搬过来，在群里显示成空卡。
+            # 注意：这里用「全表扫描 + Python 过滤」而不是 SQL 的 WHERE id LIKE，
+            # 因为海豹库的索引偶尔会损坏（integrity_check 报 wrong # of entries），
+            # 一旦查询走了坏索引就会直接抛 database disk image is malformed，
+            # 整个迁移失败。全表扫描只依赖表数据，坏索引也能正常工作。
+            attr_rows = []
+            for row in con.execute(
                 "SELECT id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,is_hidden,created_at,updated_at "
-                "FROM attrs WHERE id=? OR (id LIKE ? AND owner_id=?) ORDER BY length(data) DESC",
-                (exact_id, exact_id + "%", old_owner),
-            ).fetchall()
+                "FROM attrs"
+            ).fetchall():
+                rid = str(row["id"] or "")
+                rowner = str(row["owner_id"] or "")
+                if rid != exact_id and not rid.startswith(exact_id):
+                    continue
+                # 只认属于旧 QQ 本人的行（owner_id 是旧 QQ，或为空未被占用）。
+                # 只按 id 匹配不安全：同一条 id 可能已被别的 OpenQQ 用户接管，
+                # 那样会把别人的角色卡绑定搬过来，在群里显示成空卡。
+                if rowner not in ("", old_owner):
+                    continue
+                attr_rows.append(row)
+            attr_rows.sort(key=lambda r: len(bytes(r["data"] or b"")), reverse=True)
 
             gp = con.execute(
                 "SELECT name,last_command_time,auto_set_name_template,dice_side_num,created_at,updated_at "
@@ -572,6 +596,9 @@ class Bridge:
 
             copied_chars = []
             skipped_empty = []
+            # 旧卡 id -> 新卡 id。群属性的 binding_sheet_id 必须跟着改，
+            # 否则会指向旧 QQ 的卡、甚至别人的卡，表现就是“卡是空的”。
+            card_id_map = {}
             for a in char_rows:
                 raw = bytes(a["data"] or b"")
                 if len(raw) <= 23:
@@ -595,6 +622,7 @@ class Bridge:
                         while con.execute("SELECT 1 FROM attrs WHERE id=?", (f"{base}-{n}",)).fetchone():
                             n += 1
                         new_id = f"{base}-{n}"
+                card_id_map[old_id] = new_id
                 con.execute(
                     "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,is_hidden,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?) "
@@ -607,19 +635,41 @@ class Bridge:
                 copied_chars.append(a["name"] or new_id)
 
             copied_attrs = 0
+            group_attr_action = "none"
             if attr_rows:
                 a = attr_rows[0]
                 target_id = target_group + "-" + current
-                con.execute(
-                    "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,is_hidden,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(id) DO UPDATE SET data=excluded.data,attrs_type=excluded.attrs_type,"
-                    "binding_sheet_id=excluded.binding_sheet_id,name=excluded.name,owner_id=excluded.owner_id,"
-                    "sheet_type=excluded.sheet_type,is_hidden=excluded.is_hidden,updated_at=excluded.updated_at",
-                    (target_id, bytes(a["data"] or b""), a["attrs_type"], a["binding_sheet_id"], a["name"],
-                     current, a["sheet_type"], a["is_hidden"], a["created_at"] or now, now),
-                )
-                copied_attrs = 1
+                src_raw = bytes(a["data"] or b"")
+                existing = con.execute(
+                    "SELECT data FROM attrs WHERE id=?", (target_id,)
+                ).fetchone()
+                if existing is not None and len(bytes(existing["data"] or b"")) > 23:
+                    # 目标群里已经有真实数据（当前人物卡状态），绝不覆盖，
+                    # 否则本来好好的卡会被冲成空的。
+                    group_attr_action = "kept_existing"
+                else:
+                    # 若这张卡本次被复制过，绑定跟着指向新副本；否则保留原绑定。
+                    # 注意：不能因为「卡属于别的账号」就清空绑定 —— 海豹允许同群共用卡，
+                    # 清空会让角色面板变成空的。
+                    src_bind = (a["binding_sheet_id"] or "").strip()
+                    new_bind = card_id_map.get(src_bind, src_bind)
+                    if existing is not None:
+                        con.execute(
+                            "UPDATE attrs SET data=?,attrs_type=?,binding_sheet_id=?,name=?,owner_id=?,"
+                            "sheet_type=?,is_hidden=?,updated_at=? WHERE id=?",
+                            (src_raw, a["attrs_type"], new_bind, a["name"], current,
+                             a["sheet_type"], a["is_hidden"], now, target_id),
+                        )
+                        group_attr_action = "replaced_empty"
+                    else:
+                        con.execute(
+                            "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,is_hidden,created_at,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (target_id, src_raw, a["attrs_type"], new_bind, a["name"], current,
+                             a["sheet_type"], a["is_hidden"], a["created_at"] or now, now),
+                        )
+                        group_attr_action = "created"
+                    copied_attrs = 1
 
             if gp:
                 g = dict(gp)
@@ -667,6 +717,7 @@ class Bridge:
                 "character_count": len(copied_chars),
                 "skipped_empty_characters": skipped_empty,
                 "group_attr_count": copied_attrs,
+                "group_attr_action": group_attr_action,
                 "log_count": log_result.get("log_count", 0),
                 "log_item_count": log_result.get("log_item_count", 0),
                 "log_skipped": log_result.get("log_skipped", 0),
@@ -790,7 +841,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v2.0")
+    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.0")
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--host", default=os.environ.get("OPENQQ_BRIDGE_HOST", "127.0.0.1"),
                     help="监听地址；Docker 里需要 0.0.0.0，默认 127.0.0.1 只允许本机访问")
