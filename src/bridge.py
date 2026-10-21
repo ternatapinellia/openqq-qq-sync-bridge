@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """OpenQQ QQ Sync Bridge v3.0 - multi SeaDice instance edition."""
-import argparse, json, os, sqlite3, time, sys, secrets, smtplib, ssl
+import argparse, json, os, re, sqlite3, threading, time, sys, secrets, smtplib, ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from email.message import EmailMessage
@@ -12,6 +12,10 @@ PORT_FILE_NAME = "bridge_port.txt"
 # 备份保留策略：首次迁移快照 1 份（永不覆盖）+ 最近 N 份滚动备份。
 BACKUP_KEEP_ROLLING = 2
 BACKUP_FIRST_SUFFIX = ".snapshot-first.bak"
+
+# 增量同步：默认间隔 600 秒（10 分钟），最小 30 秒。
+SYNC_DEFAULT_INTERVAL = 600
+SYNC_CONFIG_NAME = "sync_config.json"
 
 
 def root_dir():
@@ -35,6 +39,21 @@ EMAIL_CONFIG_NAME = "email_config.json"
 BINDINGS_FILE_NAME = "bridge_bindings.json"
 
 
+def to_int(v, default=0):
+    """把 sqlite 里可能是 NULL / '' / 数字 / 数字字符串的值安全转成 int。"""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        t = str(v).strip()
+        return int(float(t)) if t else default
+    except Exception:
+        return default
+
+
 def mask_email(addr):
     try:
         local, domain = addr.split("@", 1)
@@ -56,6 +75,7 @@ class Bridge:
         self.port_file = os.path.join(root_dir(), PORT_FILE_NAME)
         self.email_config_file = os.path.join(root_dir(), EMAIL_CONFIG_NAME)
         self.bindings_file = os.path.join(root_dir(), BINDINGS_FILE_NAME)
+        self.sync_config_file = os.path.join(root_dir(), SYNC_CONFIG_NAME)
         self.pending_codes = {}
 
     def load_email_config(self):
@@ -242,6 +262,17 @@ class Bridge:
             "bound_at": int(time.time()),
         }
         self.save_bindings(bindings)
+        # 绑定成功后自动登记增量同步关系（默认开启，定时器会按间隔跑）
+        try:
+            pair = self.upsert_sync_pair(old, old_group, current, target_group, enabled=True)
+            result["sync"] = {
+                "registered": True,
+                "enabled": bool(pair.get("enabled", True)),
+                "interval": int(pair.get("interval") or SYNC_DEFAULT_INTERVAL),
+            }
+        except Exception as e:
+            self.log_error("register sync pair failed: %s: %s" % (type(e).__name__, e))
+            result["sync"] = {"registered": False, "error": str(e)}
         self.pending_codes.pop(pending_key, None)
         return result
 
@@ -429,10 +460,10 @@ class Bridge:
                 if not (tail.endswith(")") and tail[:-1].isdigit()):
                     continue
             n = con.execute(
-                "SELECT COUNT(*) FROM log_items WHERE log_id=?", (int(row["id"]),)
+                "SELECT COUNT(*) FROM log_items WHERE log_id=?", (to_int(row["id"]),)
             ).fetchone()[0]
             if int(n or 0) == int(item_count):
-                return int(row["id"])
+                return to_int(row["id"])
         return None
 
     def migrate_logs(self, old_group_id, target_group):
@@ -540,6 +571,425 @@ class Bridge:
             }
         finally:
             con.close()
+    # ==================================================================
+    # 增量同步（v3.1）
+    #   log      : 双向增量，只追加新条目，不改已有内容
+    #   角色卡   : 只增不改（已存在的按 id 跳过）
+    #   PC 数据  : 单向 OpenQQ -> 旧QQ，覆盖前先备份，并比较 updated_at
+    # ==================================================================
+
+    def load_sync_config(self):
+        try:
+            with open(self.sync_config_file, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def save_sync_config(self, d):
+        tmp = self.sync_config_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.sync_config_file)
+
+    @staticmethod
+    def sync_pair_key(old, old_group, current, target_group):
+        return f"{old}|{old_group}|{current}|{target_group}"
+
+    def list_sync_pairs(self):
+        cfg = self.load_sync_config()
+        pairs = cfg.get("pairs")
+        if not isinstance(pairs, list):
+            return []
+        out = []
+        for p in pairs:
+            if not isinstance(p, dict):
+                continue
+            if not all(str(p.get(k) or "").strip() for k in ("old", "old_group", "current", "group")):
+                continue
+            out.append(p)
+        return out
+
+    def upsert_sync_pair(self, old, old_group, current, target_group, enabled=True):
+        """登记 / 更新一条同步关系。返回该条记录。"""
+        cfg = self.load_sync_config()
+        pairs = [p for p in cfg.get("pairs", []) if isinstance(p, dict)]
+        key = self.sync_pair_key(old, old_group, current, target_group)
+        found = None
+        for p in pairs:
+            if self.sync_pair_key(p.get("old"), p.get("old_group"), p.get("current"),
+                                  p.get("group")) == key:
+                found = p
+                break
+        if found is None:
+            found = {
+                "old": str(old), "old_group": str(old_group),
+                "current": str(current), "group": str(target_group),
+                "enabled": bool(enabled),
+                "interval": SYNC_DEFAULT_INTERVAL,
+                "created_at": int(time.time()),
+                "last_run": 0,
+                "last_result": None,
+            }
+            pairs.append(found)
+        else:
+            found["enabled"] = bool(enabled)
+        cfg["pairs"] = pairs
+        self.save_sync_config(cfg)
+        return found
+
+    def remove_sync_pair(self, old, old_group, current, target_group):
+        cfg = self.load_sync_config()
+        key = self.sync_pair_key(old, old_group, current, target_group)
+        pairs = [p for p in cfg.get("pairs", []) if isinstance(p, dict)
+                 and self.sync_pair_key(p.get("old"), p.get("old_group"), p.get("current"),
+                                        p.get("group")) != key]
+        cfg["pairs"] = pairs
+        self.save_sync_config(cfg)
+        return len(pairs)
+
+    def _rolling_backup(self, src_path, label="sync"):
+        """同步前的滚动备份：只保留最近 N 份，不动首次快照。"""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        rolling = f"{src_path}.before-sync-{stamp}{('-'+label) if label else ''}.bak"
+        try:
+            self._snapshot_sqlite(src_path, rolling)
+        except Exception:
+            return None
+        self._prune_rolling_backups(src_path)
+        return rolling
+
+    # ---------------------- log 增量 ----------------------
+
+    _to_int = staticmethod(to_int)
+
+    @staticmethod
+    def _strip_copy_suffix(name):
+        """剥掉所有结尾的「 (n)」复制后缀。'甲 (2) (3)' -> '甲'"""
+        n = (name or "").strip()
+        while True:
+            mm = re.match(r"^(.*)\s+\((\d+)\)$", n)
+            if not mm:
+                break
+            n = mm.group(1).strip()
+        return n
+
+    def _match_log(self, con, group_id, name, created_at):
+        """在目标群里找「同一条 log」。
+
+        判定：把名字的 (n) 后缀全部剥掉后相同，且 created_at 相同。
+        多条命中时取条目数最多的那条（避免误配到空壳）。
+        """
+        base = self._strip_copy_suffix(name) or "未命名记录"
+        want_ca = to_int(created_at, 0)
+        hits = []
+        for row in con.execute(
+            "SELECT id,name,created_at FROM logs WHERE group_id=?", (group_id,)
+        ).fetchall():
+            if to_int(row["created_at"], 0) != want_ca:
+                continue
+            if self._strip_copy_suffix(row["name"]) != base:
+                continue
+            hits.append(int(row["id"]))
+        if not hits:
+            return None
+        if len(hits) == 1:
+            return hits[0]
+        # 多条时取条目数最多的
+        best = None
+        best_n = -1
+        for lid in hits:
+            n = int(con.execute(
+                "SELECT COUNT(*) FROM log_items WHERE log_id=?", (lid,)
+            ).fetchone()[0] or 0)
+            if n > best_n:
+                best_n = n
+                best = lid
+        return best
+
+    def _next_log_id(self, con):
+        return int(con.execute("SELECT COALESCE(MAX(id),0) FROM logs").fetchone()[0] or 0) + 1
+
+    def _next_item_id(self, con):
+        return int(con.execute("SELECT COALESCE(MAX(id),0) FROM log_items").fetchone()[0] or 0) + 1
+
+    def _append_log_items(self, con, src_log_id, dst_log_id, dst_group):
+        """把源 log 中「目标还没有的」条目追加过去。返回追加条数。"""
+        items = con.execute(
+            "SELECT id,log_id,group_id,nickname,im_userid,time,message,is_dice,command_id,"
+            "command_info,raw_msg_id,user_uniform_id,removed,parent_id "
+            "FROM log_items WHERE log_id=? ORDER BY id ASC", (to_int(src_log_id),)
+        ).fetchall()
+        have = int(con.execute(
+            "SELECT COUNT(*) FROM log_items WHERE log_id=?", (to_int(dst_log_id),)
+        ).fetchone()[0] or 0)
+        if len(items) <= have:
+            return 0
+        todo = items[have:]
+        # 目标库里已有的条目 id，用于 parent_id 映射
+        existing = con.execute(
+            "SELECT id FROM log_items WHERE log_id=? ORDER BY id ASC", (to_int(dst_log_id),)
+        ).fetchall()
+        id_map = {}
+        for i, row in enumerate(existing):
+            if i < len(items):
+                id_map[int(items[i]["id"])] = to_int(row["id"])
+        next_id = self._next_item_id(con)
+        added = 0
+        for it in todo:
+            next_id += 1
+            id_map[to_int(it["id"])] = next_id
+            parent = it["parent_id"]
+            parent_new = None
+            if parent is not None and str(parent).strip() != "":
+                parent_new = id_map.get(to_int(parent, None))
+            con.execute(
+                "INSERT INTO log_items(id,log_id,group_id,nickname,im_userid,time,message,is_dice,"
+                "command_id,command_info,raw_msg_id,user_uniform_id,removed,parent_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (next_id, to_int(dst_log_id), dst_group, it["nickname"], it["im_userid"], it["time"],
+                 it["message"], it["is_dice"], it["command_id"], it["command_info"],
+                 it["raw_msg_id"], it["user_uniform_id"], it["removed"], parent_new),
+            )
+            added += 1
+        return added
+
+    def sync_logs_direction(self, con, src_group, dst_group):
+        """把 src_group 比 dst_group 多的内容追加过去。只增不改。"""
+        stats = {"new_logs": 0, "appended_logs": 0, "items": 0, "failed": 0, "errors": []}
+        rows = con.execute(
+            "SELECT id,name,created_at,updated_at,size,extra,upload_url,upload_time "
+            "FROM logs WHERE group_id=? ORDER BY id ASC", (src_group,)
+        ).fetchall()
+        for lg in rows:
+            src_id = to_int(lg["id"])
+            title = lg["name"] or ""
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                dst_id = self._match_log(con, dst_group, lg["name"], lg["created_at"])
+                if dst_id is None:
+                    # 目标没有这条 log -> 整条复制（名字冲突则改名）
+                    new_name = self._unique_log_name(con, dst_group, title)
+                    new_id = self._next_log_id(con)
+                    con.execute(
+                        "INSERT INTO logs(id,name,group_id,created_at,updated_at,size,extra,"
+                        "upload_url,upload_time) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (new_id, new_name, dst_group, lg["created_at"], lg["updated_at"],
+                         lg["size"], lg["extra"], lg["upload_url"], lg["upload_time"]),
+                    )
+                    added = self._append_log_items(con, src_id, new_id, dst_group)
+                    con.commit()
+                    stats["new_logs"] += 1
+                    stats["items"] += added
+                else:
+                    added = self._append_log_items(con, src_id, dst_id, dst_group)
+                    if added:
+                        # 同步把 size / updated_at 顶到源那边的值
+                        con.execute(
+                            "UPDATE logs SET size=?, updated_at=? WHERE id=?",
+                            (lg["size"], lg["updated_at"], dst_id),
+                        )
+                        con.commit()
+                        stats["appended_logs"] += 1
+                        stats["items"] += added
+                    else:
+                        con.commit()
+            except Exception as e:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                stats["failed"] += 1
+                if len(stats["errors"]) < 10:
+                    stats["errors"].append("%s: %s: %s" % (title or src_id, type(e).__name__, e))
+                self.log_error("sync_logs_direction %s -> %s log %s (%r): %s: %s"
+                               % (src_group, dst_group, src_id, title, type(e).__name__, e))
+                continue
+        return stats
+
+    def sync_logs_pair(self, con, old_group_id, target_group):
+        """双向增量：先旧->新，再新->旧。"""
+        fwd = self.sync_logs_direction(con, old_group_id, target_group)
+        back = self.sync_logs_direction(con, target_group, old_group_id)
+        return {"forward": fwd, "backward": back}
+
+    # ---------------------- 角色卡 / PC 数据 ----------------------
+
+    def sync_cards_add_only(self, con, old_owner, current):
+        """旧QQ 的角色卡只增不改地补到 OpenQQ 名下。返回新增张数。"""
+        added = 0
+        rows = con.execute(
+            "SELECT id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,is_hidden,"
+            "created_at,updated_at FROM attrs"
+        ).fetchall()
+        src = [r for r in rows if str(r["owner_id"] or "") == old_owner]
+        for a in src:
+            raw = bytes(a["data"] or b"")
+            if len(raw) <= 23:
+                continue
+            new_id = str(a["id"]) + "-openqq-" + current.replace(":", "_")
+            if con.execute("SELECT 1 FROM attrs WHERE id=?", (new_id,)).fetchone():
+                continue  # 已存在 -> 不动
+            con.execute(
+                "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,"
+                "is_hidden,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (new_id, raw, a["attrs_type"], "", a["name"], current, a["sheet_type"],
+                 a["is_hidden"], a["created_at"], int(time.time() * 1000)),
+            )
+            added += 1
+        return added
+
+    def _find_openqq_state_for(self, con, old_owner, old_group_id):
+        """找出 OpenQQ 侧、与「该旧QQ + 该旧群」对应的那份 PC 状态。
+        两种情况：
+          1. 迁移时写下的 QQ-Group:<群>-OpenQQ:<user>
+          2. 用户在 OpenQQ 群里打了 .pc 后产生的 OpenQQ-Group:<...>-OpenQQ:<user>
+        """
+        cands = []
+        for r in con.execute(
+            "SELECT id,data,updated_at,owner_id,binding_sheet_id,attrs_type FROM attrs"
+        ).fetchall():
+            i = str(r["id"] or "")
+            ow = str(r["owner_id"] or "")
+            if not ow.startswith("OpenQQ:"):
+                continue
+            if r["attrs_type"] == "character":
+                continue
+            # 形如 QQ-Group:<群>-OpenQQ:<用户>
+            if i.startswith(old_group_id + "-OpenQQ:"):
+                cands.append(r)
+            # 形如 OpenQQ-Group:... 且 owner 是当前用户 -> 也算（用户后来在官方群打的）
+            elif i.startswith("OpenQQ-Group:") and i.endswith("-" + ow):
+                cands.append(r)
+        if not cands:
+            return None
+        return max(cands, key=lambda r: self._to_int(r["updated_at"], 0))
+
+    def push_pc_to_old(self, con, old_owner, old_group_id, current):
+        """把 OpenQQ 侧的 PC 状态写回旧QQ。只在 OpenQQ 侧更新时覆盖，覆盖前备份。"""
+        res = {"action": "none", "old_len": None, "new_len": None}
+        src = self._find_openqq_state_for(con, old_owner, old_group_id)
+        if src is None:
+            return res
+        src_raw = bytes(src["data"] or b"")
+        if len(src_raw) <= 23:
+            return res  # 源是空的，不回写
+        try:
+            src_doc = json.loads(src_raw.decode("utf-8"))
+            src_dict = src_doc["v"]["dict"]
+        except Exception:
+            return res
+        # 旧QQ 侧目标行（就是旧QQ自己的键）
+        tgt = con.execute(
+            "SELECT id,data,updated_at FROM attrs WHERE id=?", (old_group_id + "-" + old_owner,)
+        ).fetchone()
+        tgt_raw = bytes(tgt["data"] or b"") if tgt else b""
+        res["old_len"] = len(tgt_raw)
+        res["new_len"] = len(src_raw)
+        if tgt is not None:
+            # 旧QQ 侧的 PC 不一定带 updated_at 语义，只在「旧侧更新更早」时覆盖
+            old_ms = self._to_int(tgt["updated_at"], 0)
+            new_ms = self._to_int(src["updated_at"], 0)
+            if old_ms and new_ms and old_ms >= new_ms:
+                res["action"] = "skipped_older"
+                return res
+            merged = src_dict
+            # data 必须是 blob，海豹按 blob 读取
+            merged_raw = json.dumps({"t": 7, "v": {"dict": merged}},
+                                    ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            con.execute(
+                "UPDATE attrs SET data=?,attrs_type=?,binding_sheet_id=?,owner_id=?,sheet_type=?,"
+                "is_hidden=?,updated_at=? WHERE id=?",
+                (merged_raw, src["attrs_type"], "", old_owner, "", 1, new_ms, tgt["id"]),
+            )
+            res["action"] = "updated"
+        else:
+            merged_raw = json.dumps({"t": 7, "v": {"dict": src_dict}},
+                                    ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            con.execute(
+                "INSERT INTO attrs(id,data,attrs_type,binding_sheet_id,name,owner_id,sheet_type,"
+                "is_hidden,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (old_group_id + "-" + old_owner, merged_raw,
+                 src["attrs_type"], "", "", old_owner, "", 1, int(time.time()), self._to_int(src["updated_at"], 0)),
+            )
+            res["action"] = "created"
+        return res
+
+    # ---------------------- 全量一次同步 ----------------------
+
+    def sync_once(self, pair):
+        """对一条同步关系跑一轮：log 双向增量 + 角色卡只增 + PC 回写。"""
+        old = str(pair.get("old") or "").strip()
+        old_group = str(pair.get("old_group") or "").strip()
+        current = str(pair.get("current") or "").strip()
+        target_group = str(pair.get("group") or "").strip()
+        old_owner = "QQ:" + old if not old.startswith("QQ:") else old
+        old_group_id = old_group if old_group.startswith("QQ-Group:") else "QQ-Group:" + old_group
+
+        out = {"ok": False, "old": old, "old_group": old_group, "current": current,
+               "group": target_group, "at": int(time.time())}
+        db_backup = None
+        logs_backup = None
+        try:
+            if os.path.isfile(self.logs_path):
+                logs_backup = self._rolling_backup(self.logs_path, "incremental")
+            con = sqlite3.connect(self.logs_path, timeout=30)
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA busy_timeout=30000")
+            try:
+                out["logs"] = self.sync_logs_pair(con, old_group_id, target_group)
+            finally:
+                con.close()
+
+            db_backup = self.backup_db_before_bind(label="incremental")
+            con = self.connect(self.db_path)
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                out["cards_added"] = self.sync_cards_add_only(con, old_owner, current)
+                out["pc"] = self.push_pc_to_old(con, old_owner, old_group_id, current)
+                con.commit()
+            except Exception:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                con.close()
+            out["ok"] = True
+            out["db_backup"] = db_backup
+            out["logs_backup"] = logs_backup
+        except Exception as e:
+            out["error"] = "%s: %s" % (type(e).__name__, e)
+            self.log_error("sync_once failed for %s: %s" % (pair, out["error"]))
+        return out
+
+    def sync_all(self, only_due=False):
+        """跑所有（或到期的）同步关系。"""
+        cfg = self.load_sync_config()
+        pairs = cfg.get("pairs")
+        if not isinstance(pairs, list):
+            return {"ok": True, "ran": 0, "results": []}
+        now = int(time.time())
+        results = []
+        ran = 0
+        for p in pairs:
+            if not isinstance(p, dict) or not p.get("enabled", True):
+                continue
+            if only_due:
+                interval = self._to_int(p.get("interval"), SYNC_DEFAULT_INTERVAL)
+                last = self._to_int(p.get("last_run"), 0)
+                if last and (now - last) < max(30, interval):
+                    continue
+            res = self.sync_once(p)
+            p["last_run"] = now
+            p["last_result"] = res
+            results.append(res)
+            ran += 1
+        cfg["pairs"] = pairs
+        self.save_sync_config(cfg)
+        return {"ok": True, "ran": ran, "results": results}
+
     def bind(self, old, current, target_group, old_group):
         old_owner = "QQ:" + old
         old_group_id = "QQ-Group:" + old_group
@@ -561,7 +1011,7 @@ class Bridge:
                 if str(row["owner_id"] or "") != old_owner:
                     continue
                 char_rows.append(row)
-            char_rows.sort(key=lambda r: int(r["updated_at"] or 0), reverse=True)
+            char_rows.sort(key=lambda r: self._to_int(r["updated_at"], 0), reverse=True)
 
             exact_id = old_group_id + "-" + old_owner
             # 只认属于旧 QQ 本人的群属性行（owner_id 是旧 QQ，或为空未被占用）。
@@ -737,6 +1187,32 @@ class Bridge:
                 con.close()
 
 
+class SyncWorker(threading.Thread):
+    """后台定时器：按每条同步关系的 interval 跑增量同步。"""
+
+    def __init__(self, bridge, tick=20):
+        super().__init__(daemon=True)
+        self.bridge = bridge
+        self.tick = max(5, int(tick))
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        # 启动后稍等一会儿再跑第一轮，避免和启动流程抢资源
+        if self._stop.wait(10):
+            return
+        while not self._stop.wait(self.tick):
+            try:
+                self.bridge.sync_all(only_due=True)
+            except Exception as e:
+                try:
+                    self.bridge.log_error("sync worker tick failed: %s: %s" % (type(e).__name__, e))
+                except Exception:
+                    pass
+
+
 class Handler(BaseHTTPRequestHandler):
     bridge = None
     token = ""
@@ -792,6 +1268,50 @@ class Handler(BaseHTTPRequestHandler):
                     # with the newly saved port.
                     import threading
                     threading.Timer(0.15, self.server.shutdown).start()
+            elif u.path == "/sync-status":
+                cfg = self.bridge.load_sync_config()
+                pairs = self.bridge.list_sync_pairs()
+                last = []
+                for p in pairs:
+                    last.append({
+                        "old": p.get("old"), "old_group": p.get("old_group"),
+                        "current": p.get("current"), "group": p.get("group"),
+                        "enabled": bool(p.get("enabled", True)),
+                        "interval": to_int(p.get("interval"), SYNC_DEFAULT_INTERVAL),
+                        "last_run": to_int(p.get("last_run"), 0),
+                        "last_result": p.get("last_result"),
+                    })
+                self.send_json({"ok": True, "count": len(pairs), "pairs": last})
+            elif u.path == "/sync-now":
+                old = q.get("old", [""])[0].strip().replace("QQ:", "")
+                old_group = q.get("oldGroup", [""])[0].strip().replace("QQ-Group:", "")
+                current = q.get("current", [""])[0].strip()
+                target_group = q.get("group", [""])[0].strip()
+                if old and old_group and current and target_group:
+                    # 只跑这一条
+                    pair = {"old": old, "old_group": old_group, "current": current, "group": target_group}
+                    self.send_json(self.bridge.sync_once(pair))
+                else:
+                    self.send_json(self.bridge.sync_all(only_due=False))
+            elif u.path == "/sync-enable":
+                old = q.get("old", [""])[0].strip().replace("QQ:", "")
+                old_group = q.get("oldGroup", [""])[0].strip().replace("QQ-Group:", "")
+                current = q.get("current", [""])[0].strip()
+                target_group = q.get("group", [""])[0].strip()
+                on = q.get("on", ["1"])[0].strip() not in ("0", "false", "off", "no")
+                if not all((old, old_group, current, target_group)):
+                    raise RuntimeError("missing sync parameter")
+                p = self.bridge.upsert_sync_pair(old, old_group, current, target_group, enabled=on)
+                self.send_json({"ok": True, "enabled": bool(p.get("enabled", True))})
+            elif u.path == "/sync-remove":
+                old = q.get("old", [""])[0].strip().replace("QQ:", "")
+                old_group = q.get("oldGroup", [""])[0].strip().replace("QQ-Group:", "")
+                current = q.get("current", [""])[0].strip()
+                target_group = q.get("group", [""])[0].strip()
+                if not all((old, old_group, current, target_group)):
+                    raise RuntimeError("missing sync parameter")
+                left = self.bridge.remove_sync_pair(old, old_group, current, target_group)
+                self.send_json({"ok": True, "remaining": left})
             elif u.path == "/lookup":
                 old = q.get("old", [""])[0].strip().replace("QQ:", "")
                 if not old:
@@ -862,6 +1382,12 @@ def main():
     print(f"Data dir: {bridge.data_dir}")
     print(f"Config dir: {root_dir()}")
     print("Token required: " + ("yes" if Handler.token else "no"))
+    if os.environ.get("OPENQQ_BRIDGE_NO_SYNC", "").strip() in ("1", "true", "yes"):
+        print("Incremental sync worker: disabled (OPENQQ_BRIDGE_NO_SYNC=1)")
+    else:
+        worker = SyncWorker(bridge, tick=int(os.environ.get("OPENQQ_BRIDGE_SYNC_TICK", "20") or 20))
+        worker.start()
+        print("Incremental sync worker: started")
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 if __name__ == "__main__":

@@ -327,6 +327,131 @@ try:
     check(len(bytes(row["data"])) == 500, "group attribute data copied intact",
           "len=%d" % len(bytes(row["data"])))
 
+    # ------------------------------------------- 5d. 增量同步
+    section("5d. incremental sync")
+
+    def fresh_sync_ws(tag, src_logs, tgt_logs=None):
+        w = os.path.join(tmp, tag); shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
+        os.environ["OPENQQ_BRIDGE_ROOT"] = w   # 同步配置写进测试目录
+        mod = load_bridge()
+        make_data_db(os.path.join(w, "data.db"), with_cards=False)
+        make_logs_db(os.path.join(w, "data-logs.db"), src_logs + (tgt_logs or []))
+        return w, mod
+
+    SRC_G = OLD_GROUP
+    DST_G = "OpenQQ-Group:4016286469-INC"
+
+    # 1) 双向增量：两边各自新增的都要过去
+    w, mod = fresh_sync_ws("inc1",
+        [dict(name="旧群的团", group_id=SRC_G, created_at=111, items=["a", "b", "c"])],
+        [dict(name="新群的团", group_id=DST_G, created_at=222, items=["x", "y"])])
+    b = mod.Bridge(w)
+    pair = {"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G}
+    r = b.sync_once(pair)
+    check(r.get("ok") is True, "sync_once 成功", str(r.get("error")))
+    check(r["logs"]["forward"]["items"] == 3, "旧群 3 条 -> 新群", str(r["logs"]["forward"]))
+    check(r["logs"]["backward"]["items"] == 2, "新群 2 条 -> 旧群", str(r["logs"]["backward"]))
+    con = sqlite3.connect(os.path.join(w, "data-logs.db"))
+    for g, want in ((SRC_G, 5), (DST_G, 5)):
+        got = con.execute("SELECT COUNT(*) FROM log_items WHERE group_id=?", (g,)).fetchone()[0]
+        check(got == want, "%s 共 %d 条" % (g, want), "got %d" % got)
+    con.close()
+
+    # 2) 幂等：再跑不重复
+    r2 = b.sync_once(pair)
+    check(r2["logs"]["forward"]["items"] == 0 and r2["logs"]["backward"]["items"] == 0,
+          "再跑一轮不重复复制", json.dumps(r2["logs"], ensure_ascii=False))
+
+    # 3) 增量追加：源侧 log 变长，只追加新增部分
+    con = sqlite3.connect(os.path.join(w, "data-logs.db"))
+    lid = con.execute("SELECT id FROM logs WHERE group_id=? AND name='旧群的团'", (SRC_G,)).fetchone()[0]
+    for msg in ("d", "e"):
+        con.execute(
+            "INSERT INTO log_items(log_id,group_id,nickname,im_userid,time,message,is_dice,command_id,"
+            "command_info,raw_msg_id,user_uniform_id,removed,parent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (lid, SRC_G, "n", "u", 333, msg, 0, 0, "", "r", "u", 0, None))
+    con.commit(); con.close()
+    r3 = b.sync_once(pair)
+    check(r3["logs"]["forward"]["items"] == 2, "只追加新增的 2 条", json.dumps(r3["logs"]["forward"], ensure_ascii=False))
+    con = sqlite3.connect(os.path.join(w, "data-logs.db"))
+    dst_items = con.execute(
+        "SELECT COUNT(*) FROM log_items WHERE log_id=(SELECT id FROM logs WHERE group_id=? AND name='旧群的团')",
+        (DST_G,)).fetchone()[0]
+    con.close()
+    check(dst_items == 5, "目标侧该 log 现在 5 条", "got %d" % dst_items)
+
+    # 4) 角色卡只增不改
+    # 角色卡测试要带卡：重建一份带卡的数据
+    w = os.path.join(tmp, "inc2"); shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
+    mod = load_bridge()
+    make_data_db(os.path.join(w, "data.db"), with_cards=True)
+    make_logs_db(os.path.join(w, "data-logs.db"), [])
+    br = mod.Bridge(w)
+    r = br.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G})
+    check(r.get("cards_added", 0) >= 2, "旧QQ 的卡被补到 OpenQQ 名下", str(r.get("cards_added")))
+    con = sqlite3.connect(os.path.join(w, "data.db"))
+    n1 = con.execute("SELECT COUNT(*) FROM attrs WHERE owner_id=?", ("OpenQQ:INC",)).fetchone()[0]
+    con.close()
+    r2 = br.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": "OpenQQ:INC", "group": DST_G})
+    con = sqlite3.connect(os.path.join(w, "data.db"))
+    n2 = con.execute("SELECT COUNT(*) FROM attrs WHERE owner_id=?", ("OpenQQ:INC",)).fetchone()[0]
+    con.close()
+    check(n2 == n1, "再跑不重复加卡", "%d -> %d" % (n1, n2))
+
+    # 5) PC 单向回写 + updated_at 判断
+    w, mod = fresh_sync_ws("inc3", [])
+    b = mod.Bridge(w)
+    con = sqlite3.connect(os.path.join(w, "data.db"))
+    old_id = OLD_GROUP + "-QQ:" + OLD_QQ
+    cur = "OpenQQ:INC"
+    con.execute("INSERT INTO attrs VALUES(?,?,?,?,?,?,?,?,?,?)", (old_id,
+        json.dumps({"t":7,"v":{"dict":{"理智":{"t":0,"v":36}}}}).encode(), "", "", "", "", "coc7", 1, 1, 1000))
+    con.execute("INSERT INTO attrs VALUES(?,?,?,?,?,?,?,?,?,?)", (DST_G + "-" + cur,
+        json.dumps({"t":7,"v":{"dict":{"理智":{"t":0,"v":30},"侦查":{"t":0,"v":80}}}}).encode(),
+        "", "", "", cur, "coc7", 1, 1, 2000))
+    con.commit(); con.close()
+    r = b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": cur, "group": DST_G})
+    check(r.get("pc", {}).get("action") == "updated", "OpenQQ 侧更新 -> 写回旧QQ", str(r.get("pc")))
+    con = sqlite3.connect(os.path.join(w, "data.db")); con.row_factory = sqlite3.Row
+    row = con.execute("SELECT data FROM attrs WHERE id=?", (old_id,)).fetchone()
+    check(isinstance(row["data"], (bytes, bytearray)), "回写后的 data 是 blob", type(row["data"]).__name__)
+    d = json.loads(bytes(row["data"]).decode("utf-8"))["v"]["dict"]
+    check(d.get("理智", {}).get("v") == 30, "理智被更新为 OpenQQ 的值", str(d.get("理智")))
+    check(d.get("侦查", {}).get("v") == 80, "新增字段也带过去了", str(d.get("侦查")))
+    con.close()
+
+    # 6) 旧QQ 侧更新时不被覆盖
+    con = sqlite3.connect(os.path.join(w, "data.db"))
+    con.execute("UPDATE attrs SET data=?, updated_at=? WHERE id=?",
+                (json.dumps({"t":7,"v":{"dict":{"理智":{"t":0,"v":99}}}}).encode(), 9999, old_id))
+    con.commit(); con.close()
+    r = b.sync_once({"old": OLD_QQ, "old_group": OLD_GROUP_BARE, "current": cur, "group": DST_G})
+    check(r.get("pc", {}).get("action") == "skipped_older", "旧QQ 侧更新时不覆盖", str(r.get("pc")))
+    con = sqlite3.connect(os.path.join(w, "data.db")); con.row_factory = sqlite3.Row
+    d = json.loads(bytes(con.execute("SELECT data FROM attrs WHERE id=?", (old_id,)).fetchone()["data"]).decode())["v"]["dict"]
+    con.close()
+    check(d.get("理智", {}).get("v") == 99, "旧QQ 的 99 保住了", str(d.get("理智")))
+
+    # 7) 同步关系登记 / 开关 / 删除（用独立 root，避免互相污染）
+    w, mod = fresh_sync_ws("inc4", [])
+    _prev_root = os.environ.get("OPENQQ_BRIDGE_ROOT")
+    os.environ["OPENQQ_BRIDGE_ROOT"] = w
+    mod = load_bridge()
+    b = mod.Bridge(w)
+    try:
+        p = b.upsert_sync_pair(OLD_QQ, OLD_GROUP_BARE, "OpenQQ:INC", DST_G, enabled=True)
+        check(bool(p.get("enabled")) is True, "登记同步关系并默认开启")
+        check(len(b.list_sync_pairs()) == 1, "列表里有 1 条", str(b.list_sync_pairs()))
+        b.upsert_sync_pair(OLD_QQ, OLD_GROUP_BARE, "OpenQQ:INC", DST_G, enabled=False)
+        check(b.list_sync_pairs()[0]["enabled"] is False, "可以关闭")
+        left = b.remove_sync_pair(OLD_QQ, OLD_GROUP_BARE, "OpenQQ:INC", DST_G)
+        check(left == 0, "可以删除", "remaining=%d" % left)
+    finally:
+        if _prev_root is None:
+            os.environ.pop("OPENQQ_BRIDGE_ROOT", None)
+        else:
+            os.environ["OPENQQ_BRIDGE_ROOT"] = _prev_root
+
     # -------------------------------------------------- 6. parent_id 重映射
     section("6. parent_id remapping")
     src = [dict(name="带引用", group_id=OLD_GROUP, created_at=444,

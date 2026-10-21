@@ -234,6 +234,66 @@
     delete b[k];saveB(b);reply(ctx,msg,'已解绑。');
   });
 
+  cmd('旧QQ同步状态','查看自动同步是否开启、上次跑的时间和结果',async(ctx,msg)=>{
+    await syncPortToBridge();
+    const r=await api('/sync-status',{});
+    const ps=Array.isArray(r?.pairs)?r.pairs:[];
+    if(!ps.length)return reply(ctx,msg,'还没有任何同步关系。绑定成功后会【自动开启】定时同步。');
+    const cur=uid(ctx),grp=gid(ctx);
+    const mine=ps.filter(p=>p.current===cur&&p.group===grp);
+    const show=mine.length?mine:ps;
+    let s=mine.length?'本群的同步：':'全部同步关系（'+ps.length+' 条）：';
+    for(const p of show){
+      const ago=p.last_run?Math.round((Date.now()/1000-p.last_run)/60)+' 分钟前':'还没跑过';
+      s+=`\n\n旧QQ ${p.old} / 群 ${p.old_group}`;
+      s+=`\n  状态：${p.enabled?'开启':'已关闭'}`;
+      s+=`\n  间隔：${Math.round((p.interval||600)/60)} 分钟`;
+      s+=`\n  上次：${ago}`;
+      const lr=p.last_result;
+      if(lr){
+        if(lr.ok===false){ s+=`\n  结果：失败 ${String(lr.error||'')}`; }
+        else{
+          const f=lr.logs?.forward||{}, b=lr.logs?.backward||{};
+          s+=`\n  结果：旧→新 +${(f.new_logs||0)+(f.appended_logs||0)} 篇/+${f.items||0} 条`;
+          s+=`\n        新→旧 +${(b.new_logs||0)+(b.appended_logs||0)} 篇/+${b.items||0} 条`;
+          if(lr.cards_added) s+=`\n        角色卡 +${lr.cards_added}`;
+          if(lr.pc?.action&&lr.pc.action!=='none') s+=`\n        PC：${lr.pc.action}`;
+        }
+      }
+    }
+    reply(ctx,msg,s);
+  });
+
+  cmd('旧QQ立刻同步','马上跑一次本群的增量同步，不用等定时器',async(ctx,msg)=>{
+    await syncPortToBridge();
+    const cur=uid(ctx),grp=gid(ctx);
+    if(!cur||!grp)return reply(ctx,msg,'请在群里执行。');
+    const r=await api('/sync-now',{current:cur,group:grp});
+    const one=Array.isArray(r?.results)?(r.results[0]||{}):r;
+    if(one.ok===false)return reply(ctx,msg,`同步失败：${one.error||'未知错误'}`);
+    if(one.ok===undefined&&!one.logs)return reply(ctx,msg,'本群还没有同步关系。先执行 .旧QQ绑定。');
+    const f=one.logs?.forward||{}, b=one.logs?.backward||{};
+    let s='同步完成！';
+    s+=`\n\n旧→新：+${(f.new_logs||0)+(f.appended_logs||0)} 篇 / +${f.items||0} 条`;
+    s+=`\n新→旧：+${(b.new_logs||0)+(b.appended_logs||0)} 篇 / +${b.items||0} 条`;
+    if(one.cards_added) s+=`\n角色卡：+${one.cards_added} 张`;
+    if(one.pc?.action==='updated') s+=`\nPC 数据：已回写到旧QQ`;
+    else if(one.pc?.action==='created') s+=`\nPC 数据：已在旧QQ侧建立`;
+    else if(one.pc?.action==='skipped_older') s+=`\nPC 数据：旧QQ 那份更新，未覆盖`;
+    reply(ctx,msg,s);
+  });
+
+  cmd('旧QQ同步开关','开启或关闭本群的自动同步：.旧QQ同步开关 开 / 关',async(ctx,msg,args)=>{
+    await syncPortToBridge();
+    const v=args.getArgN(1).trim();
+    if(!['开','关','on','off'].includes(v))return reply(ctx,msg,'用法：.旧QQ同步开关 开 或 .旧QQ同步开关 关');
+    const on=['开','on'].includes(v);
+    const cur=uid(ctx),grp=gid(ctx);
+    if(!cur||!grp)return reply(ctx,msg,'请在群里执行。');
+    const r=await api('/sync-enable',{current:cur,group:grp,on:on?'1':'0'});
+    reply(ctx,msg,`本群自动同步已${r?.enabled?'开启':'关闭'}。`);
+  });
+
   seal.ext.register(ext);
   seal.ext.registerIntConfig(ext, 'bridge_port', 38999, 'Bridge端口', '同步桥设置');
   seal.ext.registerStringConfig(ext, 'bridge_host', '127.0.0.1', 'Bridge主机（Docker/远程时填写）', '同步桥设置');
