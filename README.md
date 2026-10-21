@@ -132,6 +132,33 @@
 
 ---
 
+## 时间戳修复工具（可选）
+
+早期版本有个 bug：写入 `updated_at` 时用了**毫秒**，而海豹统一用**秒**。
+这会让"谁更新"的判断失效。
+
+现在的程序已经修好（比较时会自动归一化），所以**不修也能正常用**。
+但如果你想让数据干净一些，可以跑这个工具：
+
+```sh
+# 先预览，不改任何东西
+python tools/normalize_timestamps.py 路径/data.db
+
+# 确认后实际修改（会自动备份）
+python tools/normalize_timestamps.py 路径/data.db --apply
+```
+
+工具做的事：
+- 扫描所有 `*_at` / `*_time` 字段，找出大于 `1e11` 的值（毫秒）
+- 除以 1000 变成秒
+- 修改前自动备份成 `data.db.before-tsfix-<时间>.bak`
+- 只改时间戳，不碰任何业务数据
+
+> 建议先用海豹的备份或桥生成的 `.snapshot-first.bak` 备份一次再跑，
+> 稳妥起见。工具自己也会再备份一遍。
+
+---
+
 ## 换过 OpenQQ 账号怎么办
 
 如果你之前用**另一个** OpenQQ 账号迁移过，数据就在**那个**账号名下，
@@ -234,6 +261,9 @@ docker/                       Linux 版
   bridge.py
   OpenQQ-QQ-Sync-v3.0.js
   README-DOCKER.txt
+
+tools/                        辅助工具
+  normalize_timestamps.py     时间戳修复（毫秒->秒）
 
 tests/                        自动测试
   test_bridge.py
