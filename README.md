@@ -6,8 +6,8 @@
 
 | 你的情况 | 用哪个 | 文档 |
 | --- | --- | --- |
-| 海豹跑在**自己的 Windows 电脑**上 | **Windows 版**（双击即用） | [windows/README-WINDOWS.md](windows/README-WINDOWS.md) |
-| 海豹跑在**Linux 服务器** / 容器里 / 想长期挂着 | **Docker 版** | [docker/README-DOCKER.md](docker/README-DOCKER.md) |
+| 海豹跑在**自己的 Windows 电脑**上 | **Windows 版**（双击即用） | windows/README-WINDOWS.txt |
+| 海豹跑在**Linux 服务器** / 容器里 / 想长期挂着 | **Docker 版** | docker/README-DOCKER.txt |
 
 两版功能完全一样，共用同一份源码，选一个就行。
 
@@ -27,7 +27,7 @@
    - `.旧QQ验证码 <6位验证码>`
 6. 完成，`.st` / `.pc` / `.log` 就能看到迁移过来的数据
 
-详细步骤和排错：[windows/README-WINDOWS.md](windows/README-WINDOWS.md)
+详细步骤和排错：windows/README-WINDOWS.txt
 
 ### Linux / Docker
 
@@ -40,7 +40,7 @@ curl http://127.0.0.1:38999/health
 
 然后把插件里的 **Bridge主机 / 端口 / 令牌** 填好，后续迁移步骤和 Windows 一样。
 
-详细步骤和排错：[docker/README-DOCKER.md](docker/README-DOCKER.md)
+详细步骤和排错：docker/README-DOCKER.txt
 
 ---
 
@@ -84,7 +84,7 @@ windows/                      Windows 版（单独一个文件夹，直接拿走
   OpenQQ-QQ-Sync-v2.0.js
   bridge_port.txt
   email_config.example.json
-  README-WINDOWS.md           <- Windows 使用说明
+  README-WINDOWS.txt          <- Windows 使用说明
   README-v2.0.txt             旧版说明（历史遗留）
 
 docker/                       Docker 版（把这个文件夹拷到服务器）
@@ -96,7 +96,7 @@ docker/                       Docker 版（把这个文件夹拷到服务器）
   bridge.py                   构建上下文里的副本（内容与 src 一致）
   OpenQQ-QQ-Sync-v2.0.js
   config/
-  README-DOCKER.md            <- Docker 使用说明
+  README-DOCKER.txt           <- Docker 使用说明
 
 tests/                        回归测试（不需要 Docker，也不需要真实数据）
   test_bridge.py              36 项

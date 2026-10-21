@@ -35,12 +35,12 @@ fi
 
 if [ ! -f "$DATA_DIR/data.db" ]; then
     echo "[ERROR] 找不到 $DATA_DIR/data.db" >&2
-    echo "        请把海豹的 data/default 目录挂载到 $DATA_DIR（见 README-DOCKER.md）。" >&2
+    echo "        请把海豹的 data/default 目录挂载到 $DATA_DIR（见 README-DOCKER.txt）。" >&2
     exit 1
 fi
 if [ ! -f "$DATA_DIR/data-logs.db" ]; then
     echo "[ERROR] 找不到 $DATA_DIR/data-logs.db" >&2
-    echo "        请把海豹的 data/default 目录挂载到 $DATA_DIR（见 README-DOCKER.md）。" >&2
+    echo "        请把海豹的 data/default 目录挂载到 $DATA_DIR（见 README-DOCKER.txt）。" >&2
     exit 1
 fi
 
