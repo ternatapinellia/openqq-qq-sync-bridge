@@ -62,6 +62,66 @@ check("data.db" in checks and "data-logs.db" in checks, "entrypoint 会检查海
 check("0.0.0.0" in checks, "entrypoint 让桥监听 0.0.0.0")
 check("OPENQQ_BRIDGE_TOKEN" in checks, "entrypoint 会提示未设置令牌")
 
+print("\n=== 2b. entrypoint 端口优先级 ===")
+# bridge_port.txt 必须优先于 OPENQQ_BRIDGE_PORT，且非法值要回退到环境变量。
+import subprocess as _sp
+_epcase = os.path.join(tempfile.gettempdir(), "openqq_ep_case")
+if os.path.isdir(_epcase):
+    shutil.rmtree(_epcase, ignore_errors=True)
+os.makedirs(os.path.join(_epcase, "cfg"))
+os.makedirs(os.path.join(_epcase, "data"))
+os.makedirs(os.path.join(_epcase, "bin"))
+open(os.path.join(_epcase, "data", "data.db"), "wb").close()
+open(os.path.join(_epcase, "data", "data-logs.db"), "wb").close()
+io.open(os.path.join(_epcase, "bin", "python"), "w", encoding="utf-8", newline="\n").write(
+    "#!/bin/sh\necho \"ARGS: [$*]\"\n")
+os.chmod(os.path.join(_epcase, "bin", "python"), 0o755)
+
+_bash = None
+for cand in (r"C:\Program Files\Git\bin\bash.exe", "/bin/sh"):
+    if os.path.exists(cand):
+        _bash = cand
+        break
+
+
+def _win2sh(p):
+    p = p.replace("\\", "/")
+    return "/" + p[0].lower() + p[2:]
+
+
+if _bash and os.path.exists(_bash):
+    def _run_ep(txt, env_port):
+        tf = os.path.join(_epcase, "cfg", "bridge_port.txt")
+        if os.path.exists(tf):
+            os.remove(tf)
+        if txt is not None:
+            io.open(tf, "w", encoding="utf-8", newline="\n").write(txt + "\n")
+        env = dict(os.environ)
+        env["OPENQQ_BRIDGE_DATA_DIR"] = _win2sh(os.path.join(_epcase, "data"))
+        env["OPENQQ_BRIDGE_ROOT"] = _win2sh(os.path.join(_epcase, "cfg"))
+        env["OPENQQ_BRIDGE_PORT"] = str(env_port)
+        env["OPENQQ_BRIDGE_TOKEN"] = "tok"
+        env["PATH"] = _win2sh(os.path.join(_epcase, "bin")) + ":" + env.get("PATH", "")
+        r = _sp.run([_bash, _win2sh(os.path.join(DOCKER, "entrypoint.sh"))],
+                    capture_output=True, text=True, env=env, encoding="utf-8", errors="replace")
+        line = ""
+        for l in r.stdout.splitlines():
+            if l.startswith("ARGS:"):
+                line = l
+        return line
+
+    got = _run_ep("39777", 39999)
+    check("--port 39777" in got, "bridge_port.txt 优先于环境变量", got)
+    got = _run_ep(None, 39999)
+    check("--port 39999" in got, "无 txt 时使用环境变量端口", got)
+    got = _run_ep("abc", 39999)
+    check("--port 39999" in got, "txt 非法时回退到环境变量", got)
+    got = _run_ep("99999", 39999)
+    check("--port 39999" in got, "txt 超范围时回退到环境变量", got)
+    shutil.rmtree(_epcase, ignore_errors=True)
+else:
+    print("  SKIP  bash 不可用，跳过 entrypoint 测试")
+
 print("\n=== 3. docker/bridge.py 容器参数实测 ===")
 W = os.path.join(tempfile.gettempdir(), "openqq_docker_probe")
 if os.path.isdir(W):

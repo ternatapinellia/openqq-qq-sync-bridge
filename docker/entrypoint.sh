@@ -4,13 +4,28 @@ set -e
 
 DATA_DIR="${OPENQQ_BRIDGE_DATA_DIR:-/data}"
 CONFIG_DIR="${OPENQQ_BRIDGE_ROOT:-/config}"
-PORT="${OPENQQ_BRIDGE_PORT:-38999}"
+PORT_FILE="$CONFIG_DIR/bridge_port.txt"
+DEFAULT_PORT="${OPENQQ_BRIDGE_PORT:-38999}"
 
 mkdir -p "$CONFIG_DIR" "$DATA_DIR"
 
-if [ ! -f "$CONFIG_DIR/bridge_port.txt" ]; then
-    printf '%s\n' "$PORT" > "$CONFIG_DIR/bridge_port.txt"
-    echo "[init] created $CONFIG_DIR/bridge_port.txt with port $PORT"
+# 端口来源优先级：config/bridge_port.txt（存在且合法）> OPENQQ_BRIDGE_PORT 环境变量。
+# 这样和在 Windows 上「改 txt 即改端口」的行为一致，也能配合插件的自动改端口。
+PORT=""
+if [ -f "$PORT_FILE" ]; then
+    PORT="$(tr -d ' \t\r\n' < "$PORT_FILE" 2>/dev/null || true)"
+    case "$PORT" in
+        ''|*[!0-9]*) PORT="" ;;
+    esac
+    if [ -n "$PORT" ] && { [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; }; then
+        echo "[WARN] $PORT_FILE 里的端口 '$PORT' 非法，改用 $DEFAULT_PORT" >&2
+        PORT=""
+    fi
+fi
+if [ -z "$PORT" ]; then
+    PORT="$DEFAULT_PORT"
+    printf '%s\n' "$PORT" > "$PORT_FILE"
+    echo "[init] created $PORT_FILE with port $PORT"
 fi
 
 if [ ! -f "$CONFIG_DIR/bridge_bindings.json" ]; then
@@ -36,6 +51,7 @@ fi
 
 echo "[init] data dir   : $DATA_DIR"
 echo "[init] config dir : $CONFIG_DIR"
+echo "[init] port       : $PORT"
 
 exec python /app/bridge.py \
     --host "0.0.0.0" \
