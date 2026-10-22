@@ -278,3 +278,24 @@ tests/                        自动测试
 - 验证码通过你自己配置的邮箱发出，不经过第三方。
 - Windows 版只监听 `127.0.0.1`，别的机器访问不到。
 - Linux 版必须设访问令牌。
+## v3.0 修复：兼容 GBK 编码的历史数据
+
+旧版海豹在某些 Windows 环境下会把中文按 GBK 编码写进数据库。
+桥原本按严格 UTF-8 解码，遇到这类数据会直接抛异常：
+
+```
+sqlite3.OperationalError: Could not decode to UTF-8
+column 'name' with text 'Bryana Marist (?????).st ...'
+```
+
+结果是绑定失败并返回 HTTP 500。
+
+现在所有数据库连接都使用容错解码，顺序为
+UTF-8 → GB18030 → GBK → Big5 → latin-1，最后才做字符替换。
+影响范围包括绑定、角色查询和增量同步。
+
+同时 v3.0 起绑定成功后会自动开启增量同步（每 10 分钟一次）：
+
+- log：双向增量，只追加新条目
+- 角色卡：旧QQ → OpenQQ，只增不改
+- PC 数据：OpenQQ → 旧QQ 单向回写，覆盖前自动备份
