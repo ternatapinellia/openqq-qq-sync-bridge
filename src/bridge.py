@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""OpenQQ QQ Sync Bridge v3.2 - multi SeaDice instance edition."""
+"""OpenQQ QQ Sync Bridge v3.3 - multi SeaDice instance edition."""
 import argparse, json, os, re, sqlite3, threading, time, sys, secrets, smtplib, ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from email.message import EmailMessage
 
-VERSION = "3.2"
+VERSION = "3.3"
 DEFAULT_PORT = 38999
 PORT_FILE_NAME = "bridge_port.txt"
 
@@ -480,12 +480,18 @@ class Bridge:
 
     def lookup(self, old):
         owner = "QQ:" + old
-        with self.connect(self.db_path) as con:
+        # 注意：sqlite3 的 with 只提交事务，不会关闭连接。
+        # 必须显式 close()，否则每次查询泄漏一个连接，
+        # 持有读事务会阻塞海豹的 WAL checkpoint，导致 -wal 膨胀。
+        con = self.connect(self.db_path)
+        try:
             rows = con.execute(
                 "SELECT id, attrs_type, binding_sheet_id, name, owner_id, sheet_type, "
                 "is_hidden, created_at, updated_at, length(data) AS data_size "
                 "FROM attrs WHERE owner_id=? ORDER BY updated_at DESC", (owner,)
             ).fetchall()
+        finally:
+            con.close()
         chars = [dict(r) for r in rows if r["attrs_type"] in ("character", "coc7", "dnd5e", "st") or (r["name"] and r["data_size"] is not None)]
         return {"ok": True, "characters": chars, "character_count": len(chars)}
 
@@ -1528,7 +1534,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.2")
+    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.3")
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--host", default=os.environ.get("OPENQQ_BRIDGE_HOST", "127.0.0.1"),
                     help="监听地址；Docker 里需要 0.0.0.0，默认 127.0.0.1 只允许本机访问")
