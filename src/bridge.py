@@ -67,6 +67,35 @@ def mask_email(addr):
 
 
 
+def _decode_text(raw):
+    """容错解码 SQLite TEXT：优先 UTF-8，失败后退到 GB18030/GBK。
+
+    旧版海豹在某些 Windows 环境下把中文按 GBK 写进库，
+    直接用默认 text_factory 会在读取时抛
+    "Could not decode to UTF-8 column ..."，导致整个绑定流程 500。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw
+    try:
+        return bytes(raw).decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for enc in ("gb18030", "gbk", "big5", "latin-1"):
+        try:
+            return bytes(raw).decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return bytes(raw).decode("utf-8", errors="replace")
+
+
+def _apply_text_factory(con):
+    """让连接用容错解码，避免非 UTF-8 的历史数据直接报错。"""
+    con.text_factory = _decode_text
+    return con
+
+
 class Bridge:
     def __init__(self, data_dir):
         self.data_dir = path_from_root(data_dir)
@@ -284,16 +313,16 @@ class Bridge:
 
     def connect(self, path):
         self.check()
-        con = sqlite3.connect(path, timeout=30)
+        con = _apply_text_factory(sqlite3.connect(path, timeout=30))
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA busy_timeout=30000")
         return con
 
     def _snapshot_sqlite(self, src_path, dest_path):
         # Use SQLite backup API so WAL contents are included in the snapshot.
-        src = sqlite3.connect(src_path, timeout=30)
+        src = _apply_text_factory(sqlite3.connect(src_path, timeout=30))
         try:
-            dst = sqlite3.connect(dest_path)
+            dst = _apply_text_factory(sqlite3.connect(dest_path))
             try:
                 src.backup(dst)
             finally:
@@ -405,7 +434,7 @@ class Bridge:
             if not os.path.isfile(self.logs_path):
                 return 0
             group_id = old_group if str(old_group).startswith("QQ-Group:") else ("QQ-Group:" + str(old_group))
-            con = sqlite3.connect("file:%s?mode=ro" % self.logs_path.replace("\\", "/"), uri=True)
+            con = _apply_text_factory(sqlite3.connect("file:%s?mode=ro" % self.logs_path.replace("\\", "/"), uri=True))
             try:
                 row = con.execute("SELECT COUNT(*) FROM logs WHERE group_id=?", (group_id,)).fetchone()
                 return int(row[0] or 0) if row else 0
@@ -477,7 +506,7 @@ class Bridge:
         if not os.path.isfile(self.logs_path):
             raise RuntimeError(f"data-logs.db not found: {self.logs_path}")
 
-        con = sqlite3.connect(self.logs_path, timeout=30)
+        con = _apply_text_factory(sqlite3.connect(self.logs_path, timeout=30))
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA busy_timeout=30000")
         try:
@@ -1036,7 +1065,7 @@ class Bridge:
         try:
             if os.path.isfile(self.logs_path):
                 logs_backup = self._rolling_backup(self.logs_path, "incremental")
-            con = sqlite3.connect(self.logs_path, timeout=30)
+            con = _apply_text_factory(sqlite3.connect(self.logs_path, timeout=30))
             con.row_factory = sqlite3.Row
             con.execute("PRAGMA busy_timeout=30000")
             try:
