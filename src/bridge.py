@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""OpenQQ QQ Sync Bridge v3.0 - multi SeaDice instance edition."""
+"""OpenQQ QQ Sync Bridge v3.2 - multi SeaDice instance edition."""
 import argparse, json, os, re, sqlite3, threading, time, sys, secrets, smtplib, ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from email.message import EmailMessage
 
-VERSION = "3.0"
+VERSION = "3.2"
 DEFAULT_PORT = 38999
 PORT_FILE_NAME = "bridge_port.txt"
 
@@ -154,8 +154,29 @@ class Bridge:
                 s.login(cfg["smtp_user"], cfg["smtp_password"])
                 s.send_message(msg)
 
-    def binding_key(self, old, old_group):
+    def binding_key(self, old, old_group, current="", target_group=""):
+        """同一个旧QQ可以绑多个 OpenQQ；只有完全相同的配对才算重复。"""
+        if current or target_group:
+            return f"{old}|{old_group}|{current}|{target_group}"
         return f"{old}|{old_group}"
+
+    def _lookup_binding(self, bindings, old, old_group, current, target_group):
+        """查找绑定记录，兼容升级前的旧键格式（old|old_group）。
+
+        旧格式的键里没有 OpenQQ 信息，但值里存了 current / group，
+        所以仍能判断这条记录是不是同一个配对。
+        返回 (命中的键, 记录或 None, 是否为旧格式)。
+        """
+        key = self.binding_key(old, old_group, current, target_group)
+        rec = bindings.get(key)
+        if rec:
+            return key, rec, False
+        legacy_key = f"{old}|{old_group}"
+        legacy = bindings.get(legacy_key)
+        if legacy and str(legacy.get("current", "")) == str(current) \
+                and str(legacy.get("group", "")) == str(target_group):
+            return legacy_key, legacy, True
+        return key, None, False
 
     def load_bindings(self):
         try:
@@ -229,10 +250,14 @@ class Bridge:
     def request_code(self, old, old_group, current, target_group):
         # Refuse a source QQ/group that is already bound to a different target.
         bindings = self.load_bindings()
-        key = self.binding_key(old, old_group)
-        existing = bindings.get(key)
-        if existing and (existing.get("current") != current or existing.get("group") != target_group):
-            raise RuntimeError("该旧QQ/旧群已经绑定到其他OpenQQ账号或群，为防止误绑，本次操作已拒绝。")
+        key, existing, is_legacy = self._lookup_binding(
+            bindings, old, old_group, current, target_group)
+        if existing:
+            # 只有完全相同的配对才算重复；同一个旧QQ绑到别的 OpenQQ 是允许的。
+            raise RuntimeError(
+                "该旧QQ/旧群已经绑定到当前OpenQQ，无需重复绑定。"
+                "如需绑定到另一个 OpenQQ，直接执行 .旧QQ绑定 即可。"
+            )
 
         # Confirm source data exists before sending mail.
         # 第 6 条（本次修复）：原版只要没有角色卡就直接拒绝，
@@ -278,14 +303,23 @@ class Bridge:
             raise RuntimeError(f"验证码错误，还可尝试 {remain} 次。")
 
         bindings = self.load_bindings()
-        key = self.binding_key(old, old_group)
-        existing = bindings.get(key)
-        if existing and (existing.get("current") != current or existing.get("group") != target_group):
+        key, existing, is_legacy = self._lookup_binding(
+            bindings, old, old_group, current, target_group)
+        legacy_old_key = f"{old}|{old_group}"
+        if existing:
             self.pending_codes.pop(pending_key, None)
-            raise RuntimeError("该旧QQ/旧群已经绑定到其他OpenQQ账号或群，为防止误绑，本次操作已拒绝。")
+            raise RuntimeError(
+                "该旧QQ/旧群已经绑定到当前OpenQQ，无需重复绑定。"
+                "如需绑定到另一个 OpenQQ，直接执行 .旧QQ绑定 即可。"
+            )
 
         result = self.bind(old, current, target_group, old_group)
+        # 用新键写入；如果之前是旧键格式，顺便迁移掉，避免文件里堆积死记录。
+        if is_legacy and key != legacy_old_key:
+            bindings.pop(legacy_old_key, None)
         bindings[key] = {
+            "old": str(old),
+            "old_group": str(old_group),
             "current": current,
             "group": target_group,
             "bound_at": int(time.time()),
@@ -1494,7 +1528,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.0")
+    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.2")
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--host", default=os.environ.get("OPENQQ_BRIDGE_HOST", "127.0.0.1"),
                     help="监听地址；Docker 里需要 0.0.0.0，默认 127.0.0.1 只允许本机访问")

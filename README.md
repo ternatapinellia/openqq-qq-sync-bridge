@@ -1,4 +1,4 @@
-# OpenQQ QQ Sync Bridge v3.0
+# OpenQQ QQ Sync Bridge v3.2
 
 **旧 QQ → OpenQQ 数据迁移工具**
 
@@ -10,7 +10,7 @@
 
 | 你的海豹在哪 | 用哪个 | 说明 |
 | --- | --- | --- |
-| **Windows 电脑上** | Windows 版 | [windows/README-v3.0.txt](windows/README-v3.0.txt) |
+| **Windows 电脑上** | Windows 版 | [windows/README-v3.2.txt](windows/README-v3.2.txt) |
 | **Linux 服务器上** | Linux 版 | [docker/README-DOCKER.txt](docker/README-DOCKER.txt) |
 
 两版功能一样，选一个就行。
@@ -21,11 +21,11 @@
 
 **1. 装插件**
 
-把 `OpenQQ-QQ-Sync-v3.0.js` 放进海豹的 js 插件目录，重载插件。
+把 `OpenQQ-QQ-Sync-v3.2.js` 放进海豹的 js 插件目录，重载插件。
 
 **2. 启动同步桥**
 
-- Windows：把 `OpenQQ-QQ-Sync-Bridge-v3.0.exe`、`启动OpenQQ同步桥-v3.0.cmd`、`bridge_port.txt` 放到海豹主程序目录（和 `data` 文件夹平级），双击 cmd，**窗口保持开着**。
+- Windows：把 `OpenQQ-QQ-Sync-Bridge-v3.2.exe`、`启动OpenQQ同步桥-v3.2.cmd`、`bridge_port.txt` 放到海豹主程序目录（和 `data` 文件夹平级），双击 cmd，**窗口保持开着**。
 - Linux：按 [docker/README-DOCKER.txt](docker/README-DOCKER.txt) 里的 4 步操作。
 
 **3. 在群里迁移**
@@ -207,10 +207,10 @@ python tools/normalize_timestamps.py 路径/data.db --apply
 **这是原地升级**：配置和绑定记录都会保留，不用重新绑定。
 
 1. 关掉旧的同步桥窗口
-2. 用 v3.0 的文件替换旧的（**旧的 `OpenQQ-QQ-Sync-v2.0.js` 一定要删掉**）
+2. 用 v3.2 的文件替换旧的（**旧的 `OpenQQ-QQ-Sync-v2.0.js` 一定要删掉**）
 3. 重启同步桥，重载插件
 
-> v3.0 的插件沿用 v2.0 的插件标识，所以能被海豹识别为同一个插件。
+> v3.2 的插件沿用 v2.0 的插件标识，所以能被海豹识别为同一个插件。
 > 但如果两个 js 文件同时存在，海豹只会加载先读到的那个，可能导致
 > 「看起来升级了、实际还是旧代码」。所以务必删掉旧 js。
 
@@ -241,15 +241,15 @@ v3.0 改成：**保留原来的绑定**；如果这张卡本次一起被复制�
 ```
 src/                          源码（两版共用）
   bridge.py                   同步桥
-  OpenQQ-QQ-Sync-v3.0.js      海豹插件
+  OpenQQ-QQ-Sync-v3.2.js      海豹插件
 
 windows/                      Windows 版
-  OpenQQ-QQ-Sync-Bridge-v3.0.exe
-  启动OpenQQ同步桥-v3.0.cmd
-  OpenQQ-QQ-Sync-v3.0.js
+  OpenQQ-QQ-Sync-Bridge-v3.2.exe
+  启动OpenQQ同步桥-v3.2.cmd
+  OpenQQ-QQ-Sync-v3.2.js
   bridge_port.txt
   email_config.example.json
-  README-v3.0.txt
+  README-v3.2.txt
 
 升级说明-v2到v3.txt            从 v2.0 升级的步骤
 
@@ -259,7 +259,7 @@ docker/                       Linux 版
   .env.example
   entrypoint.sh
   bridge.py
-  OpenQQ-QQ-Sync-v3.0.js
+  OpenQQ-QQ-Sync-v3.2.js
   README-DOCKER.txt
 
 tools/                        辅助工具
