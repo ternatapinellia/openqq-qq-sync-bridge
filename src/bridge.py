@@ -106,6 +106,11 @@ class Bridge:
         self.bindings_file = os.path.join(root_dir(), BINDINGS_FILE_NAME)
         self.sync_config_file = os.path.join(root_dir(), SYNC_CONFIG_NAME)
         self.pending_codes = {}
+        # 同一桥会被 HTTP 处理线程与同步定时器并发调用。
+        self._pending_lock = threading.RLock()
+        self._bindings_lock = threading.RLock()
+        # 定时同步与绑定操作会写同一批 sqlite 文件，串行化避免互相冲突。
+        self._write_lock = threading.RLock()
 
     def load_email_config(self):
         if not os.path.isfile(self.email_config_file):
@@ -179,18 +184,33 @@ class Bridge:
         return key, None, False
 
     def load_bindings(self):
-        try:
-            with open(self.bindings_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        with self._bindings_lock:
+            try:
+                with open(self.bindings_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
 
     def save_bindings(self, data):
-        tmp = self.bindings_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.bindings_file)
+        # 每次用唯一的临时文件再原子替换：多个线程共用同一个 .tmp
+        # 会互相截断，产生非法 JSON 导致绑定记录丢失。
+        with self._bindings_lock:
+            tmp = "%s.%d.%d.tmp" % (self.bindings_file, os.getpid(), threading.get_ident())
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.bindings_file)
+                tmp = None
+            finally:
+                # 成功后 tmp 已改名，不能再删（否则可能删掉别的线程刚写的文件）。
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
 
     def set_email_config(self, cfg):
         required = ["sender_email", "smtp_host", "smtp_port", "smtp_password"]
@@ -248,7 +268,11 @@ class Bridge:
         return {"ok": True, "email": mask_email(cfg["sender_email"])}
 
     def request_code(self, old, old_group, current, target_group):
-        # Refuse a source QQ/group that is already bound to a different target.
+        # ThreadingHTTPServer 并发处理请求，pending_codes 必须加锁。
+        with self._pending_lock:
+            return self._request_code_locked(old, old_group, current, target_group)
+
+    def _request_code_locked(self, old, old_group, current, target_group):
         bindings = self.load_bindings()
         key, existing, is_legacy = self._lookup_binding(
             bindings, old, old_group, current, target_group)
@@ -287,6 +311,10 @@ class Bridge:
         return {"ok": True, "email": mask_email(recipient), "expires_in": 300}
 
     def verify_code_and_bind(self, old, old_group, current, target_group, code):
+        with self._pending_lock:
+            return self._verify_code_and_bind_locked(old, old_group, current, target_group, code)
+
+    def _verify_code_and_bind_locked(self, old, old_group, current, target_group, code):
         pending_key = f"{old}|{old_group}|{current}|{target_group}"
         item = self.pending_codes.get(pending_key)
         if not item:
@@ -648,15 +676,16 @@ class Bridge:
     # ==================================================================
 
     def load_sync_config(self):
-        try:
-            with open(self.sync_config_file, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            return d if isinstance(d, dict) else {}
-        except Exception:
-            return {}
+        with self._bindings_lock:
+            try:
+                with open(self.sync_config_file, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                return d if isinstance(d, dict) else {}
+            except Exception:
+                return {}
 
     def save_sync_config(self, d):
-        tmp = self.sync_config_file + ".tmp"
+        tmp = "%s.%d.%d.tmp" % (self.sync_config_file, os.getpid(), threading.get_ident())
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
         os.replace(tmp, self.sync_config_file)
@@ -681,6 +710,10 @@ class Bridge:
 
     def upsert_sync_pair(self, old, old_group, current, target_group, enabled=True):
         """登记 / 更新一条同步关系。返回该条记录。"""
+        with self._bindings_lock:
+            return self._upsert_sync_pair_locked(old, old_group, current, target_group, enabled)
+
+    def _upsert_sync_pair_locked(self, old, old_group, current, target_group, enabled=True):
         cfg = self.load_sync_config()
         pairs = [p for p in cfg.get("pairs", []) if isinstance(p, dict)]
         key = self.sync_pair_key(old, old_group, current, target_group)
@@ -708,6 +741,10 @@ class Bridge:
         return found
 
     def remove_sync_pair(self, old, old_group, current, target_group):
+        with self._bindings_lock:
+            return self._remove_sync_pair_locked(old, old_group, current, target_group)
+
+    def _remove_sync_pair_locked(self, old, old_group, current, target_group):
         cfg = self.load_sync_config()
         key = self.sync_pair_key(old, old_group, current, target_group)
         pairs = [p for p in cfg.get("pairs", []) if isinstance(p, dict)
@@ -1103,31 +1140,34 @@ class Bridge:
         db_backup = None
         logs_backup = None
         try:
-            if os.path.isfile(self.logs_path):
-                logs_backup = self._rolling_backup(self.logs_path, "incremental")
-            con = _apply_text_factory(sqlite3.connect(self.logs_path, timeout=30))
-            con.row_factory = sqlite3.Row
-            con.execute("PRAGMA busy_timeout=30000")
-            try:
-                out["logs"] = self.sync_logs_pair(con, old_group_id, target_group)
-            finally:
-                con.close()
-
-            db_backup = self.backup_db_before_bind(label="incremental")
-            con = self.connect(self.db_path)
-            try:
-                con.execute("BEGIN IMMEDIATE")
-                out["cards_added"] = self.sync_cards_add_only(con, old_owner, current)
-                out["pc"] = self.merge_pc_fields(con, old_owner, old_group_id, current)
-                con.commit()
-            except Exception:
+            # 定时同步与 /verify-code 的绑定会改同一批 sqlite 文件，
+            # 必须串行，否则出现 SQLITE_BUSY 或互相覆盖。
+            with self._write_lock:
+                if os.path.isfile(self.logs_path):
+                    logs_backup = self._rolling_backup(self.logs_path, "incremental")
+                con = _apply_text_factory(sqlite3.connect(self.logs_path, timeout=30))
+                con.row_factory = sqlite3.Row
+                con.execute("PRAGMA busy_timeout=30000")
                 try:
-                    con.rollback()
+                    out["logs"] = self.sync_logs_pair(con, old_group_id, target_group)
+                finally:
+                    con.close()
+
+                db_backup = self.backup_db_before_bind(label="incremental")
+                con = self.connect(self.db_path)
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                    out["cards_added"] = self.sync_cards_add_only(con, old_owner, current)
+                    out["pc"] = self.merge_pc_fields(con, old_owner, old_group_id, current)
+                    con.commit()
                 except Exception:
-                    pass
-                raise
-            finally:
-                con.close()
+                    try:
+                        con.rollback()
+                    except Exception:
+                        pass
+                    raise
+                finally:
+                    con.close()
             out["ok"] = True
             out["db_backup"] = db_backup
             out["logs_backup"] = logs_backup
@@ -1163,6 +1203,10 @@ class Bridge:
         return {"ok": True, "ran": ran, "results": results}
 
     def bind(self, old, current, target_group, old_group):
+        with self._write_lock:
+            return self._bind_locked(old, current, target_group, old_group)
+
+    def _bind_locked(self, old, current, target_group, old_group):
         old_owner = "QQ:" + old
         old_group_id = "QQ-Group:" + old_group
         # 海豹的 created_at / updated_at 是【秒】，保持一致
@@ -1465,7 +1509,11 @@ class Handler(BaseHTTPRequestHandler):
                     pair = {"old": old, "old_group": old_group, "current": current, "group": target_group}
                     self.send_json(self.bridge.sync_once(pair))
                 else:
-                    self.send_json(self.bridge.sync_all(only_due=False))
+                    # 不带参数时只返回汇总，避免把所有配对结果一次性塞进回复
+                    res = self.bridge.sync_all(only_due=False)
+                    self.send_json({"ok": bool(res.get("ok")),
+                                    "ran": int(res.get("ran") or 0),
+                                    "failed": sum(1 for r in res.get("results", []) if not r.get("ok"))})
             elif u.path == "/sync-enable":
                 old = q.get("old", [""])[0].strip().replace("QQ:", "")
                 old_group = q.get("oldGroup", [""])[0].strip().replace("QQ-Group:", "")

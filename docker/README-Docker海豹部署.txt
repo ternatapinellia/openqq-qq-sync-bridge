@@ -606,6 +606,52 @@ SEALDICE_DATA_DIR 填错了，回去重新检查。
 
        如果要的是 python 而不是 python3，换成 python 再试一次。
 
+【情况 0】日志/面板出现 failure; status=1
+
+  这句话只代表「容器启动脚本非正常退出」，不是具体原因。
+  桥的启动脚本会主动 exit 1 的地方只有下面这几处，
+  先看日志里最后几行，对着下面找：
+
+  A. 出现 [ERROR] 找不到 /data/data.db 或 /data/data-logs.db
+     → 海豹数据目录填错了。见【情况 2】。
+
+  B. 出现 chmod / mkdir / Permission denied / Read-only file system
+     → 没有权限。见【情况 3】。
+
+  C. 出现 network xxx not found（这是 docker compose 自己报的，
+     不是容器内的日志）
+     → 网络名写错了。见【情况 4】。
+
+  D. 出现 exec format error、not found、$'\r'
+     → 文件换行符被 Windows 记事本改坏了。执行：
+           cd /opt/bridge33
+           sed -i 's/\r$//' entrypoint.sh docker-compose.yml
+           chmod +x entrypoint.sh
+
+  E. 日志里只有 Invalid port
+     → config/bridge_port.txt 里不是 1-65535 的数字。
+       直接改成：
+           echo 38999 > /opt/bridge33/config/bridge_port.txt
+
+  F. 日志里是 Address already in use
+     → 38999 端口被别的程序占了。改成 39000：
+
+           echo 39000 > /opt/bridge33/config/bridge_port.txt
+           docker compose restart
+
+       同时把插件里的【Bridge端口】也改成 39000。
+
+  先把日志原文发出来，就能确定是哪一种：
+       docker compose logs --tail 60 openqq-bridge
+
+  容器可能因为 restart: unless-stopped 一直重启，
+  如果看不清，可以临时停掉再看：
+       docker compose stop
+       docker compose logs --tail 80 openqq-bridge
+
+  也可以直接一条命令看退出码和状态：
+       docker inspect openqq-bridge --format '{{.State.Status}} exit={{.State.ExitCode}}'
+
 【情况 2】桥启动就退出，日志说「找不到 data.db」
 
   SEALDICE_DATA_DIR 填错了。
@@ -613,13 +659,19 @@ SEALDICE_DATA_DIR 填错了，回去重新检查。
        ls /你的路径/data.db
        ls /你的路径/data-logs.db
 
-【情况 3】报 permission denied / 写入失败
+【情况 3】报 permission denied / 写入失败 / Read-only file system
 
-  数据目录权限不够。执行：
-       sudo chmod -R 777 /你的数据目录
+  桥容器用 uid 10001 运行。海豹的 data/default 目录如果归 root，
+  它就写不了配置文件和迁移备份。
 
-  说明：桥容器用 uid 10001 运行，如果海豹目录归 root，
-        它就写不了备份。
+  先把这两个目录交给 10001（把路径换成你自己的）：
+       sudo chown -R 10001:10001 /opt/bridge33/config
+       sudo chown -R 10001:10001 /opt/sealdice1/data/default
+
+  如果还不行（有些同步盘/挂载盘不认 chown），再放宽权限：
+       sudo chmod -R 775 /opt/sealdice1/data/default
+
+  注意：不要对整个 /opt 执行 chmod/chown，只改上面这两个目录。
 
 【情况 4】docker compose 报 network not found
 
@@ -705,3 +757,94 @@ SEALDICE_DATA_DIR 填错了，回去重新检查。
   □ 8. js 放进海豹 scripts 目录，重启海豹
   □ 9. 插件配置：Bridge主机=openqq-bridge，端口=38999，令牌=.env 里那串
   □ 10. 群里发 .旧QQ桥状态 测试
+
+==============================================================
+附：本次实际部署记录（2590156487 实例，可直接照抄）
+==============================================================
+
+真实环境：Ubuntu 26.04 + Docker 29.8.1，海豹与 NapCat 都是容器，
+数据目录 /opt/SealDice-Docker/<实例ID>/data/default。
+
+【踩到的坑 1】status=1 / exit=2 的真正原因
+    容器以 uid 10001 运行，而宿主机的 config 目录归 root，
+    导致 /app/entrypoint.sh 写 bridge_bindings.json 失败：
+        cannot create /config/bridge_bindings.json: Permission denied
+    容器随即退出并被 restart 策略无限重启。
+    验证方式：
+        docker inspect openqq-bridge-2590156487 --format '{{.State.ExitCode}}'
+        docker compose logs --tail 40
+
+【踩到的坑 2】桥读不了海豹数据库
+    海豹容器以 root 跑，数据库文件是 root:root 644。
+    桥用 uid 10001 就写不了（迁移/备份都需要写）。
+
+    最省事的做法：让桥也用 root，和海豹保持一致。
+    在 docker-compose.yml 的 container_name 下面加一行：
+
+        user: "0:0"
+
+    然后 docker compose up -d 重建容器即可。
+    （这台上就是这么做的，之后不需要再 chown 海豹的数据目录。）
+
+【本次使用的 compose（/opt/openqq-bridge-2590156487/docker-compose.yml）】
+
+services:
+  openqq-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: openqq-qq-sync-bridge:3.3
+    container_name: openqq-bridge-2590156487
+    user: "0:0"
+    restart: unless-stopped
+    environment:
+      OPENQQ_BRIDGE_PORT: "38999"
+      OPENQQ_BRIDGE_TOKEN: "${OPENQQ_BRIDGE_TOKEN:?请先在 .env 里设置 OPENQQ_BRIDGE_TOKEN}"
+    volumes:
+      - "${SEALDICE_DATA_DIR:-./sealdice-data}:/data"
+      - "./config:/config"
+    networks:
+      - sealdice_net
+
+networks:
+  sealdice_net:
+    external: true
+    name: 2590156487_sealdice
+
+【插件配置可以免手工填】
+    海豹的插件配置存在
+        data/default/configs/plugin-configs.json
+    里面按插件名分组。插件名是 openqq_qq_realtime_sync_v20，
+    可以先把配置写进去，再启动海豹，海豹注册配置时会保留已写入的
+    value（只有类型变了才重置），于是桥地址/端口/令牌自动就位。
+
+    关键顺序：
+        1) 把 OpenQQ-QQ-Sync-v3.3.js 放进 scripts/
+        2) docker stop sealdice-<ID>
+        3) 写入 plugin-configs.json 里该插件的配置
+        4) docker start sealdice-<ID>
+
+    桥的主机名填【容器名】openqq-bridge-<ID>，
+    而不是 127.0.0.1，也不是宿主机 IP。
+
+【本次实例的插件配置值】
+    bridge_host  = openqq-bridge-2590156487
+    bridge_port  = 38999
+    bridge_token = <和 .env 里一致>
+    sender_email = （留空，由使用者自己填）
+    smtp_password= （留空）
+    smtp_host    = smtp.qq.com
+    smtp_port    = 465
+
+【验证命令（照抄可用）】
+    从海豹容器里直接问桥：
+        docker exec sealdice-<ID> sh -c 'wget -qO- http://openqq-bridge-<ID>:38999/health'
+
+    查某个旧 QQ 的角色卡：
+        docker exec sealdice-<ID> sh -c 'wget -qO- "http://openqq-bridge-<ID>:38999/lookup?token=<TOKEN>&old=<旧QQ号>"'
+
+    确认桥没有暴露到公网：
+        ss -lntp | grep 38999     # 应该没有输出
+
+    确认插件已被海豹加载：
+        grep -a "正在读取脚本.*OpenQQ" /opt/SealDice-Docker/<ID>/data/main.log | tail -3
