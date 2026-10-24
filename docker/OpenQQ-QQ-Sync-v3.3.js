@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenQQ旧QQ完整数据迁移-多海豹使用
 // @author       summer_pinellia@DNT
-// @version      3.0
+// @version      3.3
 // @description  OpenQQ 与旧 QQ 数据迁移；多 SeaDice 实例；绑定旧QQ时通过 旧QQ@qq.com 邮箱验证码确认【请下载相应的openqq.exe和bridge-port.txt】
 // @sealVersion  >=1.6.0
 // ==/UserScript==
@@ -10,7 +10,7 @@
   const KEY='bindings_v20';
   const PORT_KEY='bridge_port_last_v20';
   if(seal.ext.find(EXT_NAME)) return;
-  const ext=seal.ext.new(EXT_NAME,'summer_pinellia@DNT','3.0');
+  const ext=seal.ext.new(EXT_NAME,'summer_pinellia@DNT','3.3');
 
   const getPort=()=>{
     try {

@@ -11,7 +11,8 @@
 | 你的海豹在哪 | 用哪个 | 说明 |
 | --- | --- | --- |
 | **Windows 电脑上** | Windows 版 | [windows/README-v3.3.txt](windows/README-v3.3.txt) |
-| **Linux 服务器上** | Linux 版 | [docker/README-DOCKER.txt](docker/README-DOCKER.txt) |
+| **Linux 服务器（海豹装 Docker 里）** | Linux 版 | [docker/README-Docker海豹部署.txt](docker/README-Docker海豹部署.txt) |
+| **Linux 服务器（海豹直接装在宿主机）** | Linux 版 | [docker/README-DOCKER.txt](docker/README-DOCKER.txt) |
 
 两版功能一样，选一个就行。
 
@@ -26,7 +27,9 @@
 **2. 启动同步桥**
 
 - Windows：把 `OpenQQ-QQ-Sync-Bridge-v3.3.exe`、`启动OpenQQ同步桥-v3.3.cmd`、`bridge_port.txt` 放到海豹主程序目录（和 `data` 文件夹平级），双击 cmd，**窗口保持开着**。
-- Linux：按 [docker/README-DOCKER.txt](docker/README-DOCKER.txt) 里的 4 步操作。
+- Linux：
+  - 海豹装在 Docker 容器里 → [docker/README-Docker海豹部署.txt](docker/README-Docker海豹部署.txt)
+  - 海豹直接装在宿主机上 → [docker/README-DOCKER.txt](docker/README-DOCKER.txt)
 
 **3. 在群里迁移**
 
