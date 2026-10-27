@@ -380,7 +380,10 @@ class Bridge:
             raise RuntimeError(f"data-logs.db not found: {self.logs_path}")
 
     def connect(self, path):
-        self.check()
+        # 只校验即将打开的那个文件：data.db 与 data-logs.db 相互独立，
+        # 缺一个不应该让另一个也无法同步（v3.4 修正）。
+        if not os.path.isfile(path):
+            raise RuntimeError(f"database not found: {path}")
         con = _apply_text_factory(sqlite3.connect(path, timeout=30))
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA busy_timeout=30000")
@@ -701,7 +704,20 @@ class Bridge:
                     json.dump(d, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp, self.sync_config_file)
+                # Windows 上如果另一个进程/实例正在替换同一目标，
+                # os.replace 会抛 PermissionError。文件锁无法跨进程，
+                # 这里用带退避的重试兜底，保持替换的原子性。
+                last_err = None
+                for attempt in range(12):
+                    try:
+                        os.replace(tmp, self.sync_config_file)
+                        last_err = None
+                        break
+                    except OSError as e:
+                        last_err = e
+                        time.sleep(0.02 * (attempt + 1))
+                if last_err is not None:
+                    raise last_err
                 tmp = None
             finally:
                 if tmp and os.path.exists(tmp):
@@ -791,7 +807,27 @@ class Bridge:
         return True
 
     def _rolling_backup(self, src_path, label="sync"):
-        """同步前的滚动备份：只保留最近 N 份，不动首次快照。"""
+        """同步前的备份。
+
+        首次快照（.snapshot-first.bak）永不覆盖；另外保留最近 N 份滚动备份。
+        v3.4 修正：原实现只写滚动备份，导致增量同步路径永远不会产生首次快照，
+        一旦滚动备份被清理就没有任何长期基线可回滚。
+        """
+        first = src_path + BACKUP_FIRST_SUFFIX
+        if not os.path.exists(first):
+            tmp = first + ".tmp"
+            try:
+                self._snapshot_sqlite(src_path, tmp)
+                os.replace(tmp, first)
+            except Exception:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                # 首次快照失败不应阻断同步：只是少一层长期基线，
+                # 下面的滚动备份仍会尝试。
+
         stamp = time.strftime("%Y%m%d-%H%M%S")
         rolling = f"{src_path}.before-sync-{stamp}{('-'+label) if label else ''}.bak"
         try:
@@ -1179,18 +1215,36 @@ class Bridge:
             # 定时同步与 /verify-code 的绑定会改同一批 sqlite 文件，
             # 必须串行，否则出现 SQLITE_BUSY 或互相覆盖。
             with self._write_lock:
+                # 备份是保护手段，不是同步的前提：备份失败也必须继续同步，
+                # 否则磁盘临时不可写就会让所有群停止同步。
                 if os.path.isfile(self.logs_path) and self._backup_allowed(self.logs_path):
-                    logs_backup = self._rolling_backup(self.logs_path, "incremental")
-                con = _apply_text_factory(sqlite3.connect(self.logs_path, timeout=30))
-                con.row_factory = sqlite3.Row
-                con.execute("PRAGMA busy_timeout=30000")
-                try:
-                    out["logs"] = self.sync_logs_pair(con, old_group_id, target_group)
-                finally:
-                    con.close()
+                    try:
+                        logs_backup = self._rolling_backup(self.logs_path, "incremental")
+                    except Exception as e:
+                        self.log_error("rolling backup for logs failed: %s: %s" % (type(e).__name__, e))
+                # data-logs.db 缺失或被占用时不应连累角色卡/PC 同步：
+                # 日志与 data.db 是两套独立文件，缺一个另一个仍可工作。
+                if os.path.isfile(self.logs_path):
+                    try:
+                        con = _apply_text_factory(sqlite3.connect(self.logs_path, timeout=30))
+                        con.row_factory = sqlite3.Row
+                        con.execute("PRAGMA busy_timeout=30000")
+                        try:
+                            out["logs"] = self.sync_logs_pair(con, old_group_id, target_group)
+                        finally:
+                            con.close()
+                    except Exception as e:
+                        out["logs_error"] = "%s: %s" % (type(e).__name__, e)
+                        self.log_error("log sync skipped for %s: %s" % (target_group, out["logs_error"]))
+                else:
+                    out["logs_error"] = "data-logs.db not found"
+                    self.log_error("log sync skipped for %s: data-logs.db not found" % target_group)
 
                 if self._backup_allowed(self.db_path):
-                    db_backup = self.backup_db_before_bind(label="incremental")
+                    try:
+                        db_backup = self.backup_db_before_bind(label="incremental")
+                    except Exception as e:
+                        self.log_error("rolling backup for data.db failed: %s: %s" % (type(e).__name__, e))
                 con = self.connect(self.db_path)
                 try:
                     con.execute("BEGIN IMMEDIATE")
