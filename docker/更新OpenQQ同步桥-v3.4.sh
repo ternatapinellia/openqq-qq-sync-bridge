@@ -2,7 +2,7 @@
 set -e
 TARGET_DIR="${1:-$(pwd)}"
 cd "$TARGET_DIR"
-URL1="https://summer-pinellia.duckdns.org/projects/openqq-bridge/3.4.zip"
+URL1="https://summer-pinellia.duckdns.org/projects/openqq-bridge/%E6%B0%91%E8%BD%AC%E5%AE%98%E6%95%B0%E6%8D%AE3.4%EF%BC%88windows%2Blinux%EF%BC%89.zip"
 URL2="https://github.com/ternatapinellia/openqq-qq-sync-bridge/releases/download/v3.4/3.4.windows-linux.zip"
 echo "OpenQQ Sync Bridge v3.4 updater"
 echo "Target: $TARGET_DIR"

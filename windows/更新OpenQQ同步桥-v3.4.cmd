@@ -10,7 +10,7 @@ set "EXE_NAME=OpenQQ-QQ-Sync-Bridge-v3.4.exe"
 set "JS_NAME=OpenQQ-QQ-Sync-v3.4.js"
 set "README_NAME=README-v3.4.txt"
 set "START_CMD=启动OpenQQ同步桥-v3.4.cmd"
-set "URL1=https://summer-pinellia.duckdns.org/projects/openqq-bridge/3.4.zip"
+set "URL1=https://summer-pinellia.duckdns.org/projects/openqq-bridge/%E6%B0%91%E8%BD%AC%E5%AE%98%E6%95%B0%E6%8D%AE3.4%EF%BC%88windows%2Blinux%EF%BC%89.zip"
 set "URL2=https://github.com/ternatapinellia/openqq-qq-sync-bridge/releases/download/v3.4/3.4.windows-linux.zip"
 
 cd /d "%~dp0"
