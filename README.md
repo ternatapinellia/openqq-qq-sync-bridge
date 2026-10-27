@@ -1,4 +1,4 @@
-# OpenQQ QQ Sync Bridge v3.3
+# OpenQQ QQ Sync Bridge v3.4
 
 **旧 QQ → OpenQQ 数据迁移工具**
 
@@ -10,7 +10,7 @@
 
 | 你的海豹在哪 | 用哪个 | 说明 |
 | --- | --- | --- |
-| **Windows 电脑上** | Windows 版 | [windows/README-v3.3.txt](windows/README-v3.3.txt) |
+| **Windows 电脑上** | Windows 版 | [windows/README-v3.4.txt](windows/README-v3.4.txt) |
 | **Linux 服务器（海豹装 Docker 里）** | Linux 版 | [docker/README-Docker海豹部署.txt](docker/README-Docker海豹部署.txt) |
 | **Linux 服务器（海豹直接装在宿主机）** | Linux 版 | [docker/README-DOCKER.txt](docker/README-DOCKER.txt) |
 
@@ -22,11 +22,11 @@
 
 **1. 装插件**
 
-把 `OpenQQ-QQ-Sync-v3.3.js` 放进海豹的 js 插件目录，重载插件。
+把 `OpenQQ-QQ-Sync-v3.4.js` 放进海豹的 js 插件目录，重载插件。
 
 **2. 启动同步桥**
 
-- Windows：把 `OpenQQ-QQ-Sync-Bridge-v3.3.exe`、`启动OpenQQ同步桥-v3.3.cmd`、`bridge_port.txt` 放到海豹主程序目录（和 `data` 文件夹平级），双击 cmd，**窗口保持开着**。
+- Windows：把 `OpenQQ-QQ-Sync-Bridge-v3.4.exe`、`启动OpenQQ同步桥-v3.4.cmd`、`bridge_port.txt` 放到海豹主程序目录（和 `data` 文件夹平级），双击 cmd，**窗口保持开着**。
 - Linux：
   - 海豹装在 Docker 容器里 → [docker/README-Docker海豹部署.txt](docker/README-Docker海豹部署.txt)
   - 海豹直接装在宿主机上 → [docker/README-DOCKER.txt](docker/README-DOCKER.txt)
@@ -281,15 +281,15 @@ v3.0 改成：**保留原来的绑定**；如果这张卡本次一起被复制�
 ```
 src/                          源码（两版共用）
   bridge.py                   同步桥
-  OpenQQ-QQ-Sync-v3.3.js      海豹插件
+  OpenQQ-QQ-Sync-v3.4.js      海豹插件
 
 windows/                      Windows 版
-  OpenQQ-QQ-Sync-Bridge-v3.3.exe
-  启动OpenQQ同步桥-v3.3.cmd
-  OpenQQ-QQ-Sync-v3.3.js
+  OpenQQ-QQ-Sync-Bridge-v3.4.exe
+  启动OpenQQ同步桥-v3.4.cmd
+  OpenQQ-QQ-Sync-v3.4.js
   bridge_port.txt
   email_config.example.json
-  README-v3.3.txt
+  README-v3.4.txt
 
 升级说明-v2到v3.txt            从 v2.0 升级的步骤
 
@@ -299,7 +299,7 @@ docker/                       Linux 版
   .env.example
   entrypoint.sh
   bridge.py
-  OpenQQ-QQ-Sync-v3.3.js
+  OpenQQ-QQ-Sync-v3.4.js
   README-DOCKER.txt
 
 tools/                        辅助工具
@@ -339,6 +339,12 @@ UTF-8 → GB18030 → GBK → Big5 → latin-1，最后才做字符替换。
 - log：双向增量，只追加新条目
 - 角色卡：旧QQ → OpenQQ，只增不改
 - PC 数据：OpenQQ → 旧QQ 单向回写，覆盖前自动备份
+## v3.4 修复：多官bot并发丢同步队列
+
+- sync_all 不再整份写回配置，改为按 key 合并，避免覆盖并发新增的同步关系。
+- save_sync_config 加锁 + 原子替换 + 清理 .tmp，修复 Windows 上的 PermissionError。
+- 增量同步备份节流为同一文件 600 秒最多一次（首次快照与绑定路径不受影响）。
+
 ## v3.3 修复：database 连接泄漏
 
 `lookup()` 曾使用 `with self.connect(...) as con:`。Python 的 sqlite3 中

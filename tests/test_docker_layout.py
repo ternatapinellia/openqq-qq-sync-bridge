@@ -37,10 +37,10 @@ print("=== 1. 源码一致性 ===")
 a = read(os.path.join(ROOT, "src", "bridge.py"))
 b = read(os.path.join(DOCKER, "bridge.py"))
 check(a == b, "docker/bridge.py 与 src/bridge.py 一致")
-js_a = read(os.path.join(ROOT, "src", "OpenQQ-QQ-Sync-v3.3.js"))
+js_a = read(os.path.join(ROOT, "src", "OpenQQ-QQ-Sync-v3.4.js"))
 for folder in ("docker", "windows"):
-    check(read(os.path.join(ROOT, folder, "OpenQQ-QQ-Sync-v3.3.js")) == js_a,
-          "%s/OpenQQ-QQ-Sync-v3.3.js 与 src 一致" % folder)
+    check(read(os.path.join(ROOT, folder, "OpenQQ-QQ-Sync-v3.4.js")) == js_a,
+          "%s/OpenQQ-QQ-Sync-v3.4.js 与 src 一致" % folder)
 
 print("\n=== 2. Dockerfile / compose ===")
 df = read(os.path.join(DOCKER, "Dockerfile"))

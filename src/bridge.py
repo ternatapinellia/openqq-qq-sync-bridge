@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""OpenQQ QQ Sync Bridge v3.3 - multi SeaDice instance edition."""
+"""OpenQQ QQ Sync Bridge v3.4 - multi SeaDice instance edition."""
 import argparse, json, os, re, sqlite3, threading, time, sys, secrets, smtplib, ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from email.message import EmailMessage
 
-VERSION = "3.3"
+VERSION = "3.4"
 DEFAULT_PORT = 38999
 PORT_FILE_NAME = "bridge_port.txt"
 
@@ -16,6 +16,10 @@ BACKUP_FIRST_SUFFIX = ".snapshot-first.bak"
 # 增量同步：默认间隔 600 秒（10 分钟），最小 30 秒。
 SYNC_DEFAULT_INTERVAL = 600
 SYNC_CONFIG_NAME = "sync_config.json"
+
+# 增量同步备份节流：同一文件 N 秒内最多备份一次。
+# 多官bot时每群每轮都全量快照会把 I/O 放大几十倍（data-logs.db 常有几百 MB）。
+BACKUP_MIN_INTERVAL = 600
 
 
 def root_dir():
@@ -111,6 +115,8 @@ class Bridge:
         self._bindings_lock = threading.RLock()
         # 定时同步与绑定操作会写同一批 sqlite 文件，串行化避免互相冲突。
         self._write_lock = threading.RLock()
+        # 增量同步备份节流：{path: 上次备份时间}，只在 _write_lock 内访问。
+        self._last_backup_at = {}
 
     def load_email_config(self):
         if not os.path.isfile(self.email_config_file):
@@ -685,10 +691,24 @@ class Bridge:
                 return {}
 
     def save_sync_config(self, d):
-        tmp = "%s.%d.%d.tmp" % (self.sync_config_file, os.getpid(), threading.get_ident())
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.sync_config_file)
+        # 同一把锁保护：HTTP 线程（绑定/改端口）与后台 SyncWorker 会同时写这个文件。
+        # 不加锁时 os.replace 在 Windows 上会抛 PermissionError，
+        # 且异常路径会留下 .tmp 垃圾文件。
+        with self._bindings_lock:
+            tmp = "%s.%d.%d.tmp" % (self.sync_config_file, os.getpid(), threading.get_ident())
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(d, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.sync_config_file)
+                tmp = None
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
 
     @staticmethod
     def sync_pair_key(old, old_group, current, target_group):
@@ -753,6 +773,22 @@ class Bridge:
         cfg["pairs"] = pairs
         self.save_sync_config(cfg)
         return len(pairs)
+
+    def _backup_allowed(self, path):
+        """增量同步是否该做滚动备份（节流）。
+
+        首次快照永远允许；此后同一文件 BACKUP_MIN_INTERVAL 秒内只备一次。
+        bind() 路径不经过这里，始终备份。
+        """
+        first = path + BACKUP_FIRST_SUFFIX
+        if not os.path.exists(first):
+            return True
+        now = time.time()
+        last = self._last_backup_at.get(path, 0)
+        if now - last < BACKUP_MIN_INTERVAL:
+            return False
+        self._last_backup_at[path] = now
+        return True
 
     def _rolling_backup(self, src_path, label="sync"):
         """同步前的滚动备份：只保留最近 N 份，不动首次快照。"""
@@ -1143,7 +1179,7 @@ class Bridge:
             # 定时同步与 /verify-code 的绑定会改同一批 sqlite 文件，
             # 必须串行，否则出现 SQLITE_BUSY 或互相覆盖。
             with self._write_lock:
-                if os.path.isfile(self.logs_path):
+                if os.path.isfile(self.logs_path) and self._backup_allowed(self.logs_path):
                     logs_backup = self._rolling_backup(self.logs_path, "incremental")
                 con = _apply_text_factory(sqlite3.connect(self.logs_path, timeout=30))
                 con.row_factory = sqlite3.Row
@@ -1153,7 +1189,8 @@ class Bridge:
                 finally:
                     con.close()
 
-                db_backup = self.backup_db_before_bind(label="incremental")
+                if self._backup_allowed(self.db_path):
+                    db_backup = self.backup_db_before_bind(label="incremental")
                 con = self.connect(self.db_path)
                 try:
                     con.execute("BEGIN IMMEDIATE")
@@ -1177,7 +1214,13 @@ class Bridge:
         return out
 
     def sync_all(self, only_due=False):
-        """跑所有（或到期的）同步关系。"""
+        """跑所有（或到期的）同步关系。
+
+        注意：绝不能把「开始时读到的 pairs」整份写回去。
+        sync_once 可能跑很久，这期间别的群可能正好完成绑定（upsert_sync_pair），
+        整份写回会把那些刚登记的关系覆盖掉 —— 表现就是「明明绑定了却不同步」。
+        因此这里只把本轮的结果按 key 合并回最新配置。
+        """
         cfg = self.load_sync_config()
         pairs = cfg.get("pairs")
         if not isinstance(pairs, list):
@@ -1185,6 +1228,7 @@ class Bridge:
         now = int(time.time())
         results = []
         ran = 0
+        updates = {}
         for p in pairs:
             if not isinstance(p, dict) or not p.get("enabled", True):
                 continue
@@ -1194,12 +1238,30 @@ class Bridge:
                 if last and (now - last) < max(30, interval):
                     continue
             res = self.sync_once(p)
-            p["last_run"] = now
-            p["last_result"] = res
+            updates[self.sync_pair_key(p.get("old"), p.get("old_group"),
+                                       p.get("current"), p.get("group"))] = {
+                "last_run": now,
+                "last_result": res,
+            }
             results.append(res)
             ran += 1
-        cfg["pairs"] = pairs
-        self.save_sync_config(cfg)
+
+        if updates:
+            with self._bindings_lock:
+                latest = self.load_sync_config()
+                latest_pairs = latest.get("pairs")
+                if isinstance(latest_pairs, list):
+                    for p in latest_pairs:
+                        if not isinstance(p, dict):
+                            continue
+                        k = self.sync_pair_key(p.get("old"), p.get("old_group"),
+                                               p.get("current"), p.get("group"))
+                        up = updates.get(k)
+                        if up:
+                            p["last_run"] = up["last_run"]
+                            p["last_result"] = up["last_result"]
+                    latest["pairs"] = latest_pairs
+                    self.save_sync_config(latest)
         return {"ok": True, "ran": ran, "results": results}
 
     def bind(self, old, current, target_group, old_group):
@@ -1582,7 +1644,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.3")
+    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.4")
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--host", default=os.environ.get("OPENQQ_BRIDGE_HOST", "127.0.0.1"),
                     help="监听地址；Docker 里需要 0.0.0.0，默认 127.0.0.1 只允许本机访问")
