@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal EnableDelayedExpansion
 chcp 65001 >nul
 rem ==========================================================
@@ -22,8 +22,8 @@ echo Target: %CD%
 echo.
 
 set "RUNNING="
-tasklist /FI "IMAGENAME eq %EXE_NAME%" 2>nul | find /I "%EXE_NAME%" >nul && set "RUNNING=1"
-if not defined RUNNING tasklist /FI "IMAGENAME eq OpenQQ-QQ-Sync-Bridge-v3.3.exe" 2>nul | find /I "OpenQQ-QQ-Sync-Bridge-v3.3.exe" >nul && set "RUNNING=1"
+tasklist /FO CSV /NH /FI "IMAGENAME eq %EXE_NAME%" 2>nul | find /I "%EXE_NAME%" >nul && set "RUNNING=1"
+if not defined RUNNING tasklist /FO CSV /NH /FI "IMAGENAME eq OpenQQ-QQ-Sync-Bridge-v3.3.exe" 2>nul | find /I "OpenQQ-QQ-Sync-Bridge-v3.3.exe" >nul && set "RUNNING=1"
 if defined RUNNING (
   echo [info] Bridge is running. It must be closed before update.
   choice /C YN /M "Kill it automatically"
