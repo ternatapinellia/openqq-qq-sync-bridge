@@ -1,5 +1,5 @@
 ==============================================================
-  3.4 同步桥 —— Linux + Docker 海豹 部署说明
+  3.5 同步桥 —— Linux + Docker 海豹 部署说明
 ==============================================================
 
 适用情况：
@@ -95,14 +95,14 @@
 ==============================================================
 
 【先说结论】
-  先把你下载到的「民转官数据3.4（windows+linux）.zip」解压。
+  先把你下载到的「民转官数据3.5（windows+linux）.zip」解压。
   你要传的，是解压后里面的 docker 这个文件夹，一共就这几个东西。
   里面 .py / .yml / .sh 结尾的看起来像代码，但你【一个字都不用改】，
   照抄下面的命令就行。
 
   解压后长这样：
 
-      民转官数据3.4/
+      民转官数据3.5/
         docker/                      ← 只要这个文件夹
           Dockerfile
           docker-compose.yml
@@ -111,7 +111,7 @@
           .env.example
           config/
             bridge_port.txt
-          OpenQQ-QQ-Sync-v3.4.js
+          OpenQQ-QQ-Sync-v3.5.js
           README-DOCKER.txt
         windows/                     ← Windows 电脑用的，服务器不用管
 
@@ -169,7 +169,7 @@
 
   ［第一步］先传到服务器的 /opt（不要直接传到 /opt/bridge33）：
 
-      scp -r "D:\下载\民转官数据3.4\docker" root@你的服务器IP:/opt
+      scp -r "D:\下载\民转官数据3.5\docker" root@你的服务器IP:/opt
 
   ［第二步］再登录服务器改名字：
 
@@ -188,17 +188,17 @@
     * 服务器不给用 root 登录的话，换成你的用户名，
       并且传到自己的家目录：
 
-          scp -r "D:\下载\民转官数据3.4\docker" 你的用户名@你的服务器IP:/home/你的用户名
+          scp -r "D:\下载\民转官数据3.5\docker" 你的用户名@你的服务器IP:/home/你的用户名
           mv /home/你的用户名/docker /home/你的用户名/bridge33
 
     * SSH 端口不是 22 的话（注意是大写 P）：
 
-          scp -P 2222 -r "D:\下载\民转官数据3.4\docker" root@你的服务器IP:/opt
+          scp -P 2222 -r "D:\下载\民转官数据3.5\docker" root@你的服务器IP:/opt
           mv /opt/docker /opt/bridge33
 
     * Mac / Linux 本机的路径写法不一样，比如：
 
-          scp -r ~/Downloads/民转官数据3.4/docker root@你的服务器IP:/opt
+          scp -r ~/Downloads/民转官数据3.5/docker root@你的服务器IP:/opt
           mv /opt/docker /opt/bridge33
 
   如果提示 Permission denied，就是没权限往 /opt 写，
@@ -240,7 +240,7 @@
 
   1) 在自己电脑上，右键 docker 文件夹 → 压缩成 docker.zip
      （注意是【只压缩 docker 这一个文件夹】，不要把整个
-       民转官数据3.4 都压进去，不然路径会多一层）
+       民转官数据3.5 都压进去，不然路径会多一层）
 
   2) 通过面板把 docker.zip 上传到 /opt
 
@@ -301,7 +301,7 @@
           entrypoint.sh
           bridge.py
           config/            （里面有 bridge_port.txt）
-          OpenQQ-QQ-Sync-v3.4.js
+          OpenQQ-QQ-Sync-v3.5.js
 
       看不到 .env.example 是正常的（隐藏文件），
       用 ls -la 就能看到。
@@ -336,7 +336,7 @@
   A：没权限写那个目录。两个办法：
        一是直接传到自己家目录 /home/你的用户名/ 下面；
        二是先传到 /tmp，再登录服务器用 sudo 挪过去：
-           scp -r "D:\下载\民转官数据3.4\docker" 你的用户名@你的服务器IP:/tmp
+           scp -r "D:\下载\民转官数据3.5\docker" 你的用户名@你的服务器IP:/tmp
            # 然后在服务器上执行：
            sudo mv /tmp/docker /opt/bridge33
            sudo chown -R root:root /opt/bridge33
@@ -415,7 +415,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: openqq-qq-sync-bridge:3.4
+    image: openqq-qq-sync-bridge:3.5
     container_name: openqq-bridge
     restart: unless-stopped
     environment:
@@ -485,7 +485,7 @@ networks:
     [init] data dir   : /data
     [init] config dir : /config
     [init] port       : 38999
-    OpenQQ QQ Sync Bridge v3.4
+    OpenQQ QQ Sync Bridge v3.5
     Listening: 0.0.0.0:38999
     Incremental sync worker: started
 
@@ -505,7 +505,7 @@ SEALDICE_DATA_DIR 填错了，回去重新检查。
 第 7 步：把插件放进海豹
 ==============================================================
 
-把 OpenQQ-QQ-Sync-v3.4.js 放进海豹的 scripts 目录。
+把 OpenQQ-QQ-Sync-v3.5.js 放进海豹的 scripts 目录。
 
 如果是 docker 海豹，宿主机上的路径通常在：
 
@@ -513,7 +513,7 @@ SEALDICE_DATA_DIR 填错了，回去重新检查。
 
 复制过去：
 
-    cp /opt/bridge33/OpenQQ-QQ-Sync-v3.4.js /opt/sealdice1/data/default/scripts/
+    cp /opt/bridge33/OpenQQ-QQ-Sync-v3.5.js /opt/sealdice1/data/default/scripts/
 
 然后重启海豹容器，或者在 WebUI 里重载插件：
 
@@ -833,7 +833,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: openqq-qq-sync-bridge:3.4
+    image: openqq-qq-sync-bridge:3.5
     container_name: openqq-bridge-2590156487
     user: "0:0"
     restart: unless-stopped
@@ -859,7 +859,7 @@ networks:
     value（只有类型变了才重置），于是桥地址/端口/令牌自动就位。
 
     关键顺序：
-        1) 把 OpenQQ-QQ-Sync-v3.4.js 放进 scripts/
+        1) 把 OpenQQ-QQ-Sync-v3.5.js 放进 scripts/
         2) docker stop sealdice-<ID>
         3) 写入 plugin-configs.json 里该插件的配置
         4) docker start sealdice-<ID>

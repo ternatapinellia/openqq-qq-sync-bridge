@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""OpenQQ QQ Sync Bridge v3.4 - multi SeaDice instance edition."""
+"""OpenQQ QQ Sync Bridge v3.5 - multi SeaDice instance edition."""
 import argparse, json, os, re, sqlite3, threading, time, sys, secrets, smtplib, ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from email.message import EmailMessage
 
-VERSION = "3.4"
+VERSION = "3.5"
 DEFAULT_PORT = 38999
 PORT_FILE_NAME = "bridge_port.txt"
 
@@ -20,6 +20,114 @@ SYNC_CONFIG_NAME = "sync_config.json"
 # 增量同步备份节流：同一文件 N 秒内最多备份一次。
 # 多官bot时每群每轮都全量快照会把 I/O 放大几十倍（data-logs.db 常有几百 MB）。
 BACKUP_MIN_INTERVAL = 600
+
+
+def _commit_file(src, dst, attempts=6, base_delay=0.02):
+    """把 src 原子替换成 dst，失败则退避重试，最后兜底直接覆盖。
+
+    Windows 上 os.replace / MoveFileEx 要求目标文件带 DELETE 权限，
+    只要此刻**有任何人**（杀软实时扫描、Windows 搜索索引器、网盘同步、
+    甚至本进程另一个线程的 open() 读）打开着目标文件，就会抛
+    PermissionError: [WinError 5] 拒绝访问 —— 这不是逻辑错误，是瞬时冲突。
+    v3.3 遇到它直接 500，表现为「绑定成功但同步关系没登记」「配置写失败」。
+    这里退避重试，仍然不行就降级为直接覆盖（非原子，但保住这次更新）。
+    """
+    last = None
+    for i in range(max(1, attempts)):
+        try:
+            os.replace(src, dst)
+            return "replace"
+        except OSError as e:
+            last = e
+            time.sleep(base_delay * (i + 1))
+    backup = dst + ".committing"
+    try:
+        with open(src, "rb") as fr:
+            payload = fr.read()
+    except Exception:
+        raise last if last else RuntimeError("replace failed: %s -> %s" % (src, dst))
+
+    had_dst = os.path.exists(dst)
+    try:
+        if had_dst:
+            with open(dst, "rb") as fr:
+                old_payload = fr.read()
+            with open(backup, "wb") as fb:
+                fb.write(old_payload)
+                fb.flush()
+                os.fsync(fb.fileno())
+        with open(backup + ".new", "wb") as fw:
+            fw.write(payload)
+            fw.flush()
+            os.fsync(fw.fileno())
+        try:
+            os.replace(backup + ".new", dst)
+        except OSError:
+            with open(backup + ".new", "rb") as fr:
+                data = fr.read()
+            with open(dst, "wb") as fw:
+                fw.write(data)
+                fw.flush()
+                os.fsync(fw.fileno())
+            if os.path.getsize(dst) != len(data):
+                raise IOError("short write to %s" % dst)
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+        return "fallback"
+    except Exception:
+        try:
+            if had_dst and os.path.exists(backup):
+                with open(backup, "rb") as fr:
+                    old_payload = fr.read()
+                with open(dst, "wb") as fw:
+                    fw.write(old_payload)
+                    fw.flush()
+                    os.fsync(fw.fileno())
+        except Exception:
+            pass
+        raise last if last else RuntimeError("replace failed: %s -> %s" % (src, dst))
+    finally:
+        for leftover in (backup, backup + ".new"):
+            try:
+                if os.path.exists(leftover):
+                    os.remove(leftover)
+            except OSError:
+                pass
+
+
+def _pid_alive(pid):
+    """判断某个进程号是否还活着（用来判断 .tmp 文件是不是孤儿）。"""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong(0)
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return True          # 查不出来就当它还活着，宁可留垃圾也不要误删
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def root_dir():
@@ -117,6 +225,44 @@ class Bridge:
         self._write_lock = threading.RLock()
         # 增量同步备份节流：{path: 上次备份时间}，只在 _write_lock 内访问。
         self._last_backup_at = {}
+        self._cleanup_stale_tmp()
+
+    def _cleanup_stale_tmp(self):
+        """清掉上次被强杀/写失败留下的 *.tmp 垃圾文件。
+
+        写配置用的是「唯一临时文件 + 原子替换」，进程被 taskkill /F 干掉时，
+        临时文件就留在目录里了（实测 6 次强杀里会碰上 1 次，卡在写入那一瞬间）。
+
+        判断「这个 tmp 还有主吗」：
+          1. 文件名里带写入者的 pid（<配置名>.<pid>.<线程号>.tmp）。
+             进程已经不在 -> 立刻删，不管多新。强杀后几秒内就重启也能清干净。
+          2. 解析不出 pid，或者 pid 已被系统复用 -> 退回按年龄判断，
+             超过 60 秒才删（避免误删另一个正在运行的桥的进行中文件）。
+        """
+        for base in (self.bindings_file, self.sync_config_file, self.port_file):
+            folder = os.path.dirname(os.path.abspath(base)) or "."
+            prefix = os.path.basename(base) + "."
+            try:
+                for name in os.listdir(folder):
+                    if not (name.startswith(prefix) and name.endswith(".tmp")):
+                        continue
+                    path = os.path.join(folder, name)
+                    rest = name[len(prefix):-len(".tmp")]
+                    pid = None
+                    try:
+                        pid = int(rest.split(".")[0])
+                    except (ValueError, IndexError):
+                        pid = None
+                    try:
+                        if pid is not None and pid != os.getpid() and not _pid_alive(pid):
+                            os.remove(path)
+                            continue
+                        if time.time() - os.path.getmtime(path) >= 60:
+                            os.remove(path)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
 
     def load_email_config(self):
         if not os.path.isfile(self.email_config_file):
@@ -208,7 +354,7 @@ class Bridge:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp, self.bindings_file)
+                _commit_file(tmp, self.bindings_file)
                 tmp = None
             finally:
                 # 成功后 tmp 已改名，不能再删（否则可能删掉别的线程刚写的文件）。
@@ -381,7 +527,7 @@ class Bridge:
 
     def connect(self, path):
         # 只校验即将打开的那个文件：data.db 与 data-logs.db 相互独立，
-        # 缺一个不应该让另一个也无法同步（v3.4 修正）。
+        # 缺一个不应该让另一个也无法同步。
         if not os.path.isfile(path):
             raise RuntimeError(f"database not found: {path}")
         con = _apply_text_factory(sqlite3.connect(path, timeout=30))
@@ -428,7 +574,7 @@ class Bridge:
             tmp = first + ".tmp"
             try:
                 self._snapshot_sqlite(self.db_path, tmp)
-                os.replace(tmp, first)
+                _commit_file(tmp, first)
             except Exception:
                 try:
                     if os.path.exists(tmp):
@@ -453,7 +599,7 @@ class Bridge:
             tmp = first + ".tmp"
             try:
                 self._snapshot_sqlite(self.logs_path, tmp)
-                os.replace(tmp, first)
+                _commit_file(tmp, first)
             except Exception:
                 try:
                     if os.path.exists(tmp):
@@ -486,7 +632,7 @@ class Bridge:
         tmp = self.port_file + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="") as f:
             f.write(str(int(port)) + "\n")
-        os.replace(tmp, self.port_file)
+        _commit_file(tmp, self.port_file)
         return int(port)
 
     def read_saved_port(self):
@@ -704,20 +850,7 @@ class Bridge:
                     json.dump(d, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                # Windows 上如果另一个进程/实例正在替换同一目标，
-                # os.replace 会抛 PermissionError。文件锁无法跨进程，
-                # 这里用带退避的重试兜底，保持替换的原子性。
-                last_err = None
-                for attempt in range(12):
-                    try:
-                        os.replace(tmp, self.sync_config_file)
-                        last_err = None
-                        break
-                    except OSError as e:
-                        last_err = e
-                        time.sleep(0.02 * (attempt + 1))
-                if last_err is not None:
-                    raise last_err
+                _commit_file(tmp, self.sync_config_file)
                 tmp = None
             finally:
                 if tmp and os.path.exists(tmp):
@@ -810,23 +943,20 @@ class Bridge:
         """同步前的备份。
 
         首次快照（.snapshot-first.bak）永不覆盖；另外保留最近 N 份滚动备份。
-        v3.4 修正：原实现只写滚动备份，导致增量同步路径永远不会产生首次快照，
-        一旦滚动备份被清理就没有任何长期基线可回滚。
+        只写滚动备份会让增量同步路径永远没有长期基线。
         """
         first = src_path + BACKUP_FIRST_SUFFIX
         if not os.path.exists(first):
             tmp = first + ".tmp"
             try:
                 self._snapshot_sqlite(src_path, tmp)
-                os.replace(tmp, first)
+                _commit_file(tmp, first)
             except Exception:
                 try:
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 except Exception:
                     pass
-                # 首次快照失败不应阻断同步：只是少一层长期基线，
-                # 下面的滚动备份仍会尝试。
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         rolling = f"{src_path}.before-sync-{stamp}{('-'+label) if label else ''}.bak"
@@ -1215,15 +1345,13 @@ class Bridge:
             # 定时同步与 /verify-code 的绑定会改同一批 sqlite 文件，
             # 必须串行，否则出现 SQLITE_BUSY 或互相覆盖。
             with self._write_lock:
-                # 备份是保护手段，不是同步的前提：备份失败也必须继续同步，
-                # 否则磁盘临时不可写就会让所有群停止同步。
                 if os.path.isfile(self.logs_path) and self._backup_allowed(self.logs_path):
                     try:
                         logs_backup = self._rolling_backup(self.logs_path, "incremental")
                     except Exception as e:
-                        self.log_error("rolling backup for logs failed: %s: %s" % (type(e).__name__, e))
-                # data-logs.db 缺失或被占用时不应连累角色卡/PC 同步：
-                # 日志与 data.db 是两套独立文件，缺一个另一个仍可工作。
+                        self.log_error("rolling backup for logs failed: %s: %s"
+                                       % (type(e).__name__, e))
+
                 if os.path.isfile(self.logs_path):
                     try:
                         con = _apply_text_factory(sqlite3.connect(self.logs_path, timeout=30))
@@ -1235,7 +1363,8 @@ class Bridge:
                             con.close()
                     except Exception as e:
                         out["logs_error"] = "%s: %s" % (type(e).__name__, e)
-                        self.log_error("log sync skipped for %s: %s" % (target_group, out["logs_error"]))
+                        self.log_error("log sync skipped for %s: %s"
+                                       % (target_group, out["logs_error"]))
                 else:
                     out["logs_error"] = "data-logs.db not found"
                     self.log_error("log sync skipped for %s: data-logs.db not found" % target_group)
@@ -1244,7 +1373,8 @@ class Bridge:
                     try:
                         db_backup = self.backup_db_before_bind(label="incremental")
                     except Exception as e:
-                        self.log_error("rolling backup for data.db failed: %s: %s" % (type(e).__name__, e))
+                        self.log_error("rolling backup for data.db failed: %s: %s"
+                                       % (type(e).__name__, e))
                 con = self.connect(self.db_path)
                 try:
                     con.execute("BEGIN IMMEDIATE")
@@ -1698,7 +1828,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.4")
+    ap = argparse.ArgumentParser(description="OpenQQ QQ Sync Bridge v3.5")
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--host", default=os.environ.get("OPENQQ_BRIDGE_HOST", "127.0.0.1"),
                     help="监听地址；Docker 里需要 0.0.0.0，默认 127.0.0.1 只允许本机访问")
@@ -1725,6 +1855,10 @@ def main():
         worker = SyncWorker(bridge, tick=int(os.environ.get("OPENQQ_BRIDGE_SYNC_TICK", "20") or 20))
         worker.start()
         print("Incremental sync worker: started")
+    # backlog 默认只有 5。十几个官bot 同时绑定时，每个 /verify-code 要在服务端
+    # 跑上秒级（迁移角色卡 + log），accept 稍微跟不上新连接就会被内核丢掉，
+    # 插件那边看到的是「连接被重置 / 请求失败」，而群里其实已经绑好了。
+    ThreadingHTTPServer.request_queue_size = 256
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 if __name__ == "__main__":
